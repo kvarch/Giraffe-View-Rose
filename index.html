@@ -279,6 +279,58 @@ async function renderLayer(name, fc, style) {
   }
 }
 
+
+// ─── Edifícios do mapa base via OSM Overpass API ──────────────────────────────
+// Os edifícios do mapa base do Giraffe são tiles vetoriais do Mapbox (OSM) e não
+// são acessíveis como geometria pelo SDK. Buscamos os mesmos dados na fonte:
+// a API Overpass do OpenStreetMap, com cache por posição+raio.
+async function fetchOSMBuildings(obs, radiusM) {
+  // Cache: reutiliza se o observador moveu <100m e o raio não aumentou
+  if (osmCache.center && osmCache.radius >= radiusM) {
+    const moved = turf.distance(turf.point(osmCache.center), turf.point(obs), { units: 'meters' });
+    if (moved < 100) return osmCache.features;
+  }
+
+  setStatus('compute', 'Buscando edifícios do mapa (OSM)...');
+  const query = `[out:json][timeout:25];(way["building"](around:${Math.round(radiusM * 1.2)},${obs[1]},${obs[0]}););out geom;`;
+
+  try {
+    const res = await fetch('https://overpass-api.de/api/interpreter', {
+      method: 'POST',
+      body: 'data=' + encodeURIComponent(query),
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    });
+    if (!res.ok) throw new Error('Overpass HTTP ' + res.status);
+    const data = await res.json();
+
+    const feats = [];
+    for (const el of (data.elements || [])) {
+      if (el.type !== 'way' || !el.geometry || el.geometry.length < 4) continue;
+      const ring = el.geometry.map(g => [g.lon, g.lat]);
+      // Garantir anel fechado
+      if (ring[0][0] !== ring[ring.length-1][0] || ring[0][1] !== ring[ring.length-1][1]) ring.push(ring[0]);
+      // Altura: tag height (m) > building:levels × 3m > 10m default
+      const tags = el.tags || {};
+      let h = parseFloat(tags.height) || 0;
+      if (!h && tags['building:levels']) h = (parseFloat(tags['building:levels']) || 0) * 3;
+      if (!h) h = 10; // edifício OSM sem altura: assume 10m (~3 pavimentos)
+      try {
+        feats.push(turf.polygon([ring], { _baseHeight: 0, _height: h, source: 'osm' }));
+      } catch {}
+    }
+
+    osmCache.center = obs;
+    osmCache.radius = radiusM;
+    osmCache.features = feats;
+    console.log(`[Isovist] OSM: ${feats.length} edifícios carregados`);
+    return feats;
+  } catch(e) {
+    console.warn('[Isovist] Overpass falhou:', e);
+    setStatus('compute', 'OSM indisponível — usando só edifícios do projeto');
+    return osmCache.features || [];
+  }
+}
+
 // ─── Cálculo: wedges coloridos por distância (estilo Ladybug) ─────────────────
 async function compute() {
   const obs = S.observer;
@@ -296,7 +348,12 @@ async function compute() {
   let polys = [];
   if (S.useObs) {
     setStatus('compute', 'Coletando obstáculos...');
-    const obstacles = getObstacles(S.observerFeatId);
+    let obstacles = getObstacles(S.observerFeatId);
+    // Incluir edifícios do mapa base (OSM) se habilitado
+    if (S.useOSM) {
+      const osmFeats = await fetchOSMBuildings(obs, S.radius);
+      obstacles = obstacles.concat(osmFeats);
+    }
     S.obstCount = obstacles.length;
     // Usa a mesma lógica de altura do castRaysTurf (levels * floorToFloor)
     const tall = obstacles.filter(f => {
@@ -361,40 +418,124 @@ async function compute() {
     prevDist = tipDist;
   }
 
-  // Renderizar wedges com data-driven color
+  // Renderizar wedges
   setStatus('compute', `Renderizando ${wedgeFeatures.length} fatias...`);
-  const fc = { type: 'FeatureCollection', features: wedgeFeatures };
-
   const h = S.observerHeight;
-  await renderLayer(`${LO}_rose`, fc, {
-    type: 'fill-extrusion',
-    paint: {
-      'fill-extrusion-color': ['get', 'color'],
-      'fill-extrusion-opacity': 0.65,
-      'fill-extrusion-base': h,
-      'fill-extrusion-height': h + 0.5,
-      'fill-extrusion-translate-anchor': 'map'
-    }
-  });
-  // Contorno 2D no chão para referência
-  await renderLayer(`${LO}_edge`, fc, {
-    type: 'line',
-    paint: { 'line-color': ['get', 'color'], 'line-width': 0.5, 'line-opacity': 0.4 }
-  });
 
-  // Ponto observador
-  await renderLayer(`${LO}_obs`, { type:'FeatureCollection', features:[turf.point(obs)] }, {
-    type: 'circle',
-    paint: { 'circle-color': '#fff', 'circle-radius': 5, 'circle-stroke-color': '#000', 'circle-stroke-width': 2 }
-  });
+  if (S.permanent) {
+    // ── Modo permanente: cria seções reais no projeto (rawSections) ──────────
+    // Para não pesar o modelo, agrupa fatias consecutivas de cor semelhante
+    // (12 buckets) em polígonos-leque únicos — reduz ~180 fatias para ~15-30.
+    await renderPermanent(obs, wedgeFeatures, h);
+    // Limpa as camadas temporárias se existirem
+    try { await rpc.invoke('removeTempLayer', [`${LO}_rose`]); } catch {}
+    try { await rpc.invoke('removeTempLayer', [`${LO}_edge`]); } catch {}
+    try { await rpc.invoke('removeTempLayer', [`${LO}_obs`]); } catch {}
+  } else {
+    // ── Modo temporário (padrão): rápido, some ao fechar o projeto ───────────
+    const fc = { type: 'FeatureCollection', features: wedgeFeatures };
+    await renderLayer(`${LO}_rose`, fc, {
+      type: 'fill-extrusion',
+      paint: {
+        'fill-extrusion-color': ['get', 'color'],
+        'fill-extrusion-opacity': 0.65,
+        'fill-extrusion-base': h,
+        'fill-extrusion-height': h + 0.5,
+        'fill-extrusion-translate-anchor': 'map'
+      }
+    });
+    await renderLayer(`${LO}_edge`, fc, {
+      type: 'line',
+      paint: { 'line-color': ['get', 'color'], 'line-width': 0.5, 'line-opacity': 0.4 }
+    });
+    await renderLayer(`${LO}_obs`, { type:'FeatureCollection', features:[turf.point(obs)] }, {
+      type: 'circle',
+      paint: { 'circle-color': '#fff', 'circle-radius': 5, 'circle-stroke-color': '#000', 'circle-stroke-width': 2 }
+    });
+    // Remove seções permanentes antigas se o usuário desligou o modo
+    await deletePermanentSections();
+  }
 
   return wedgeFeatures.length;
+}
+
+// ─── Modo permanente: seções reais com sp_tag para atualização idempotente ────
+const SP_TAG = 'isovist_rose';
+
+async function deletePermanentSections() {
+  try {
+    let raw = giraffeState.get('rawSections') || [];
+    if (!Array.isArray(raw)) raw = raw.features || Object.values(raw) || [];
+    const ids = raw
+      .filter(f => f?.properties?.sp_tag === SP_TAG)
+      .map(f => f.properties?.id || f.id)
+      .filter(Boolean);
+    if (ids.length > 0) {
+      await rpc.invoke('deleteRawSections', [ids]);
+    }
+  } catch(e) { console.warn('[Isovist] deletePermanentSections:', e); }
+}
+
+async function renderPermanent(obs, wedges, h) {
+  // 1. Agrupar wedges consecutivos por bucket de cor (12 níveis)
+  const BUCKETS = 12;
+  const groups = [];
+  let cur = null;
+
+  for (const w of wedges) {
+    const bucket = Math.min(BUCKETS - 1, Math.floor(w.properties.dist_ratio * BUCKETS));
+    if (cur && cur.bucket === bucket) {
+      // Estende o leque atual: adiciona a ponta nova
+      cur.tips.push(w.geometry.coordinates[0][2]); // tipCoord do wedge
+      cur.ratios.push(w.properties.dist_ratio);
+    } else {
+      if (cur) groups.push(cur);
+      // wedge coords: [obs, prevTip, tipCoord, obs]
+      cur = {
+        bucket,
+        tips: [w.geometry.coordinates[0][1], w.geometry.coordinates[0][2]],
+        ratios: [w.properties.dist_ratio],
+      };
+    }
+  }
+  if (cur) groups.push(cur);
+
+  // 2. Montar features leque com cor média do grupo
+  const sectionFeatures = [];
+  for (const g of groups) {
+    const avgRatio = g.ratios.reduce((a, b) => a + b, 0) / g.ratios.length;
+    const color = distanceToColor(avgRatio);
+    try {
+      const fan = turf.polygon([[obs, ...g.tips, obs]]);
+      fan.properties = {
+        layerId: 'default',        // obrigatório para importRawSections
+        sp_tag: SP_TAG,            // marcador para deleção idempotente
+        color: color,
+        _baseHeight: h,
+        _height: 0.5,
+        stroke: color,
+        'stroke-opacity': 0.9,
+      };
+      sectionFeatures.push(fan);
+    } catch {}
+  }
+
+  // 3. Deletar seções antigas e criar as novas
+  await deletePermanentSections();
+  try {
+    await rpc.invoke('createRawSections', [sectionFeatures]);
+    console.log(`[Isovist] ${sectionFeatures.length} seções permanentes criadas (de ${wedges.length} fatias)`);
+  } catch(e) {
+    console.error('[Isovist] createRawSections:', e);
+    setStatus('error', 'Falha ao criar seções permanentes: ' + e);
+  }
 }
 
 async function clearLayers() {
   try { await rpc.invoke('removeTempLayer', [`${LO}_rose`]); } catch {}
   try { await rpc.invoke('removeTempLayer', [`${LO}_edge`]); } catch {}
   try { await rpc.invoke('removeTempLayer', [`${LO}_obs`]); } catch {}
+  await deletePermanentSections();
 }
 
 // ─── UI ───────────────────────────────────────────────────────────────────────
@@ -456,14 +597,28 @@ async function fromSel() {
     S.observer = c;
     S.observerLabel = 'Edifício selecionado';
     S.observerFeatId = f.properties?.id || null;
-    // Ler altura do elemento selecionado (tenta várias fontes)
-    const props = f.properties || {};
-    const bh = props._baseHeight || 0;
-    const ht = props._height || props.height || 0;
-    const coordZ = f.geometry?.coordinates?.[2] || 0;
-    // Usa o topo do edifício (base + altura), ou coordenada Z para pontos
-    S.observerHeight = (bh + ht) || coordZ || 0;
-    console.log('[Isovist] Altura do elemento:', { _baseHeight: bh, _height: ht, coordZ, total: S.observerHeight, props });
+    // Ler altura do elemento selecionado (robusto para pontos e polígonos)
+    let props = f.properties || {};
+    // Se getSelectedFeatures veio sem as props de altura, busca a feição
+    // completa no rawSections pelo id
+    if (props._baseHeight === undefined && props.id) {
+      let raw = giraffeState.get('rawSections') || [];
+      if (!Array.isArray(raw)) raw = raw.features || Object.values(raw) || [];
+      const full = raw.find(rf => rf?.properties?.id === props.id);
+      if (full?.properties) props = full.properties;
+    }
+    const bh = Number(props._baseHeight ?? props.baseHeight) || 0;
+    let ht = Number(props._height ?? props.height) || 0;
+    if (!ht && props.levels !== undefined && props.floorToFloor !== undefined) {
+      ht = (Number(props.levels) || 0) * (Number(props.floorToFloor) || 0);
+    }
+    const coordZ = Number(f.geometry?.coordinates?.[2]) || 0;
+    const isPoint = f.geometry?.type === 'Point';
+    // PONTO: usa o _baseHeight direto (onde o ponto está posicionado no 3D).
+    // POLÍGONO: usa o topo (base + altura do edifício).
+    S.observerHeight = isPoint ? (bh || coordZ) : (bh + ht) || coordZ;
+    S.observerLabel = isPoint ? 'Ponto selecionado' : 'Edifício selecionado';
+    console.log('[Isovist] Altura:', JSON.stringify({ isPoint, _baseHeight: bh, _height: ht, coordZ, result: S.observerHeight }));
     const slH = document.getElementById('sl-h');
     if (slH) { slH.value = S.observerHeight; document.getElementById('lbl-h').textContent = Math.round(S.observerHeight) + 'm'; }
     renderObs(); await runCompute();
@@ -500,7 +655,10 @@ document.getElementById('root').innerHTML = `
     <button class="btn btn-clear" id="btn-clear" style="display:none">✕ Limpar análise</button>
     <div class="divider"><span>Obstruções</span></div>
     <div class="toggle-row"><button class="toggle" id="toggle-obs"></button><span class="toggle-label">Raycasting contra edifícios</span></div>
+    <div class="toggle-row"><button class="toggle" id="toggle-osm"></button><span class="toggle-label">Incluir edifícios do mapa base (OSM)</span></div>
     <div class="info-box" id="info-obs">—</div>
+    <div class="divider"><span>Saída</span></div>
+    <div class="toggle-row"><button class="toggle" id="toggle-perm"></button><span class="toggle-label">Layer permanente (salvo no projeto)</span></div>
     <div class="divider"><span>Parâmetros</span></div>
     <div class="sl-grp"><div class="sl-row"><span class="sl-lbl">Altura do observador</span><span class="sl-val" id="lbl-h">0m</span></div><input type="range" id="sl-h" min="0" max="300" step="1" value="0"/><div class="sl-ticks"><span>0m</span><span>150m</span><span>300m</span></div></div>
     <div class="sl-grp"><div class="sl-row"><span class="sl-lbl">Raio máximo</span><span class="sl-val" id="lbl-r">300m</span></div><input type="range" id="sl-r" min="50" max="1000" step="25" value="300"/><div class="sl-ticks"><span>50m</span><span>500m</span><span>1km</span></div></div>
@@ -515,7 +673,7 @@ document.getElementById('root').innerHTML = `
       <div class="legend-labels"><span>Bloqueado (perto)</span><span>Livre (longe)</span></div>
     </div>
   </div>
-  <footer class="ftr"><p>Estilo Ladybug · Turf.js · Giraffe iFrame SDK · <strong style="color:#00ACCD">v23</strong></p></footer>
+  <footer class="ftr"><p>Estilo Ladybug · Turf.js · Giraffe iFrame SDK · <strong style="color:#00ACCD">v24</strong></p></footer>
 </div>`;
 
 // ── Wire ─────────────────────────────────────────────────────────────────────
@@ -523,6 +681,8 @@ document.getElementById('btn-sel').addEventListener('click', fromSel);
 document.getElementById('btn-point').addEventListener('click', fromMap);
 document.getElementById('btn-clear').addEventListener('click', clearAll);
 document.getElementById('toggle-obs').addEventListener('click', function () { S.useObs = !S.useObs; this.className = 'toggle' + (S.useObs ? ' on' : ''); scheduleRecompute(); });
+document.getElementById('toggle-osm').addEventListener('click', function () { S.useOSM = !S.useOSM; this.className = 'toggle' + (S.useOSM ? ' on' : ''); scheduleRecompute(); });
+document.getElementById('toggle-perm').addEventListener('click', function () { S.permanent = !S.permanent; this.className = 'toggle' + (S.permanent ? ' on' : ''); scheduleRecompute(); });
 document.getElementById('sl-h').addEventListener('input', e => { S.observerHeight = +e.target.value; document.getElementById('lbl-h').textContent = S.observerHeight + 'm'; scheduleRecompute(); });
 document.getElementById('sl-r').addEventListener('input', e => { S.radius = +e.target.value; document.getElementById('lbl-r').textContent = S.radius + 'm'; scheduleRecompute(); });
 document.getElementById('sl-c').addEventListener('input', e => { S.cone = +e.target.value; document.getElementById('lbl-c').textContent = S.cone >= 359.9 ? '360° (View Rose)' : S.cone + '°'; document.getElementById('grp-dir').style.display = S.cone >= 359.9 ? 'none' : ''; scheduleRecompute(); });
