@@ -98,6 +98,8 @@ const S = {
   observerHeight: 0,  // altura do ponto de observação (metros)
   radius: 300, cone: 360, coneDir: 0,
   useObs: false,
+  useOSM: false,        // incluir edifícios do mapa base (OSM)
+  permanent: false,     // renderizar em layer permanente (rawSections)
   bands: [
     { label: 'Próximo',  dist: 100, color: '#00ACCD', opacity: 0.55 },
     { label: 'Médio',    dist: 250, color: '#2DD4BF', opacity: 0.40 },
@@ -105,6 +107,8 @@ const S = {
   ],
   status: 'idle', computeMs: null, obstCount: 0,
 };
+// Cache de edifícios OSM (evita re-fetch a cada mudança de slider)
+const osmCache = { center: null, radius: 0, features: [] };
 let isListening = false, debounce = null;
 
 // ─── Obter obstáculos ─────────────────────────────────────────────────────────
@@ -601,11 +605,20 @@ async function fromSel() {
     let props = f.properties || {};
     // Se getSelectedFeatures veio sem as props de altura, busca a feição
     // completa no rawSections pelo id
-    if (props._baseHeight === undefined && props.id) {
+    if (props._baseHeight === undefined) {
       let raw = giraffeState.get('rawSections') || [];
       if (!Array.isArray(raw)) raw = raw.features || Object.values(raw) || [];
-      const full = raw.find(rf => rf?.properties?.id === props.id);
-      if (full?.properties) props = full.properties;
+      // Tenta por id primeiro; depois por coordenadas (pontos)
+      let full = props.id ? raw.find(rf => rf?.properties?.id === props.id) : null;
+      if (!full && f.geometry?.type === 'Point') {
+        const [fx, fy] = f.geometry.coordinates;
+        full = raw.find(rf => {
+          if (rf?.geometry?.type !== 'Point') return false;
+          const [rx, ry] = rf.geometry.coordinates;
+          return Math.abs(rx - fx) < 1e-7 && Math.abs(ry - fy) < 1e-7;
+        });
+      }
+      if (full?.properties) props = { ...full.properties, ...props };
     }
     const bh = Number(props._baseHeight ?? props.baseHeight) || 0;
     let ht = Number(props._height ?? props.height) || 0;
@@ -673,7 +686,7 @@ document.getElementById('root').innerHTML = `
       <div class="legend-labels"><span>Bloqueado (perto)</span><span>Livre (longe)</span></div>
     </div>
   </div>
-  <footer class="ftr"><p>Estilo Ladybug · Turf.js · Giraffe iFrame SDK · <strong style="color:#00ACCD">v24</strong></p></footer>
+  <footer class="ftr"><p>Estilo Ladybug · Turf.js · Giraffe iFrame SDK · <strong style="color:#00ACCD">v25</strong></p></footer>
 </div>`;
 
 // ── Wire ─────────────────────────────────────────────────────────────────────
