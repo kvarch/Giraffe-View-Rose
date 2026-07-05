@@ -78,6 +78,11 @@
     .legend{background:#141921;border:1px solid #1e2433;border-radius:6px;padding:8px 10px}
     .legend-bar{height:10px;border-radius:3px;background:linear-gradient(90deg,#d73027,#fc8d59,#fee08b,#d9ef8b,#66bd63,#1a9850);margin-bottom:4px}
     .legend-labels{display:flex;justify-content:space-between;font-size:9px;color:#4a5568}
+    .val-wrap{display:flex;align-items:center;gap:3px}
+    .val-input{width:52px;padding:2px 5px;background:#0f1117;border:1px solid #1e2433;border-radius:4px;color:#00ACCD;font-size:11.5px;font-weight:600;text-align:right;font-family:inherit;font-variant-numeric:tabular-nums}
+    .val-input:focus{outline:none;border-color:#00ACCD60}
+    .val-input::-webkit-inner-spin-button{opacity:.3}
+    .val-unit{font-size:11px;color:#4a5568}
     .palette-row{display:flex;align-items:center;gap:6px;margin-bottom:6px}
     .palette-row select{flex:1;padding:5px 8px;background:#0f1117;border:1px solid #1e2433;border-radius:5px;color:#c0ccd8;font-size:11px;font-family:inherit;cursor:pointer;appearance:none;-webkit-appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 24 24' fill='none' stroke='%234a5568' stroke-width='2'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 8px center;padding-right:24px}
     .palette-row select:focus{outline:none;border-color:#00ACCD60}
@@ -567,6 +572,8 @@ function renderBtns() {
   else if (S.status === 'compute') { bp.disabled = true; bs.disabled = true; }
   else { bp.className = 'btn btn-primary'; bp.innerHTML = '◎ Observar de um ponto no mapa'; bp.disabled = false; bs.disabled = false; }
   bc.style.display = (S.status === 'done' || S.status === 'error') ? '' : 'none';
+  const br = document.getElementById('btn-redo');
+  if (br) br.style.display = (S.observer && S.status !== 'waiting' && S.status !== 'compute') ? '' : 'none';
 }
 function renderInfo() {
   const el = document.getElementById('info-obs'); if (!el) return;
@@ -586,6 +593,37 @@ async function runCompute() {
     setStatus('done', `${n || 0} fatias${hTxt} · ${S.computeMs}ms`);
   } catch (e) { console.error(e); setStatus('error', String(e)); }
   renderBtns();
+}
+
+
+// ─── Sincronizar slider + input numérico ──────────────────────────────────────
+function syncControl(key, value) {
+  const sl = document.getElementById('sl-' + key);
+  const num = document.getElementById('num-' + key);
+  if (sl) sl.value = value;
+  if (num) num.value = value;
+}
+
+// ─── Herdar altura de um ponto existente próximo ao clique ────────────────────
+// drawPoint retorna só [lng,lat]; se o clique foi sobre/perto de um ponto do
+// projeto, herda o _baseHeight dele (tolerância ~8m).
+function inheritPointHeight(coord) {
+  let raw = giraffeState.get('rawSections') || [];
+  if (!Array.isArray(raw)) raw = raw.features || Object.values(raw) || [];
+  let best = null, bestDist = 8; // metros
+  for (const rf of raw) {
+    if (rf?.geometry?.type !== 'Point') continue;
+    try {
+      const d = turf.distance(turf.point(coord), turf.point(rf.geometry.coordinates), { units: 'meters' });
+      if (d < bestDist) { bestDist = d; best = rf; }
+    } catch {}
+  }
+  if (best) {
+    const bh = Number(best.properties?._baseHeight ?? best.properties?.baseHeight) || 0;
+    console.log('[Isovist] Ponto próximo encontrado a ' + bestDist.toFixed(1) + 'm, _baseHeight=' + bh);
+    return bh;
+  }
+  return null;
 }
 
 // ─── Ações ────────────────────────────────────────────────────────────────────
@@ -632,8 +670,7 @@ async function fromSel() {
     S.observerHeight = isPoint ? (bh || coordZ) : (bh + ht) || coordZ;
     S.observerLabel = isPoint ? 'Ponto selecionado' : 'Edifício selecionado';
     console.log('[Isovist] Altura:', JSON.stringify({ isPoint, _baseHeight: bh, _height: ht, coordZ, result: S.observerHeight }));
-    const slH = document.getElementById('sl-h');
-    if (slH) { slH.value = S.observerHeight; document.getElementById('lbl-h').textContent = Math.round(S.observerHeight) + 'm'; }
+    syncControl('h', Math.round(S.observerHeight));
     renderObs(); await runCompute();
   } catch (e) { setStatus('error', String(e)); renderBtns(); }
 }
@@ -646,7 +683,15 @@ async function fromMap() {
   try {
     const pt = await rpc.invoke('drawPoint', []);
     if (!isListening) return;
-    if (pt) { isListening = false; S.observer = Array.isArray(pt) ? pt : [pt.lng ?? pt[0], pt.lat ?? pt[1]]; S.observerLabel = 'Ponto no mapa'; renderObs(); await runCompute(); }
+    if (pt) {
+      isListening = false;
+      S.observer = Array.isArray(pt) ? pt : [pt.lng ?? pt[0], pt.lat ?? pt[1]];
+      S.observerLabel = 'Ponto no mapa';
+      // Herdar altura de ponto existente próximo ao clique
+      const inherited = inheritPointHeight(S.observer);
+      if (inherited !== null) { S.observerHeight = inherited; syncControl('h', Math.round(inherited)); }
+      renderObs(); await runCompute();
+    }
   } catch { console.warn('drawPoint indisponível'); }
 }
 
@@ -665,6 +710,7 @@ document.getElementById('root').innerHTML = `
     <div class="divider"><span>Ponto de observação</span></div>
     <button class="btn btn-sel" id="btn-sel">⊙ Observar do edifício selecionado</button>
     <button class="btn btn-primary" id="btn-point">◎ Observar de um ponto no mapa</button>
+    <button class="btn btn-primary" id="btn-redo" style="display:none">↻ Refazer análise</button>
     <button class="btn btn-clear" id="btn-clear" style="display:none">✕ Limpar análise</button>
     <div class="divider"><span>Obstruções</span></div>
     <div class="toggle-row"><button class="toggle" id="toggle-obs"></button><span class="toggle-label">Raycasting contra edifícios</span></div>
@@ -673,10 +719,10 @@ document.getElementById('root').innerHTML = `
     <div class="divider"><span>Saída</span></div>
     <div class="toggle-row"><button class="toggle" id="toggle-perm"></button><span class="toggle-label">Layer permanente (salvo no projeto)</span></div>
     <div class="divider"><span>Parâmetros</span></div>
-    <div class="sl-grp"><div class="sl-row"><span class="sl-lbl">Altura do observador</span><span class="sl-val" id="lbl-h">0m</span></div><input type="range" id="sl-h" min="0" max="300" step="1" value="0"/><div class="sl-ticks"><span>0m</span><span>150m</span><span>300m</span></div></div>
-    <div class="sl-grp"><div class="sl-row"><span class="sl-lbl">Raio máximo</span><span class="sl-val" id="lbl-r">300m</span></div><input type="range" id="sl-r" min="50" max="1000" step="25" value="300"/><div class="sl-ticks"><span>50m</span><span>500m</span><span>1km</span></div></div>
-    <div class="sl-grp"><div class="sl-row"><span class="sl-lbl">Abertura do cone</span><span class="sl-val" id="lbl-c">360° (View Rose)</span></div><input type="range" id="sl-c" min="10" max="360" step="5" value="360"/><div class="sl-ticks"><span>10°</span><span>180°</span><span>360°</span></div></div>
-    <div class="sl-grp" id="grp-dir" style="display:none"><div class="sl-row"><span class="sl-lbl">Direção do cone</span><span class="sl-val" id="lbl-d">0°</span></div><input type="range" id="sl-d" min="0" max="355" step="5" value="0"/><div class="sl-ticks"><span>E</span><span>N/S</span><span>W</span></div></div>
+    <div class="sl-grp"><div class="sl-row"><span class="sl-lbl">Altura do observador</span><span class="val-wrap"><input type="number" class="val-input" id="num-h" min="0" max="300" step="1" value="0"/><span class="val-unit">m</span></span></div><input type="range" id="sl-h" min="0" max="300" step="1" value="0"/><div class="sl-ticks"><span>0m</span><span>150m</span><span>300m</span></div></div>
+    <div class="sl-grp"><div class="sl-row"><span class="sl-lbl">Raio máximo</span><span class="val-wrap"><input type="number" class="val-input" id="num-r" min="50" max="1000" step="25" value="300"/><span class="val-unit">m</span></span></div><input type="range" id="sl-r" min="50" max="1000" step="25" value="300"/><div class="sl-ticks"><span>50m</span><span>500m</span><span>1km</span></div></div>
+    <div class="sl-grp"><div class="sl-row"><span class="sl-lbl">Abertura do cone</span><span class="val-wrap"><input type="number" class="val-input" id="num-c" min="10" max="360" step="5" value="360"/><span class="val-unit">°</span></span></div><input type="range" id="sl-c" min="10" max="360" step="5" value="360"/><div class="sl-ticks"><span>10°</span><span>180°</span><span>360°</span></div></div>
+    <div class="sl-grp" id="grp-dir" style="display:none"><div class="sl-row"><span class="sl-lbl">Direção do cone</span><span class="val-wrap"><input type="number" class="val-input" id="num-d" min="0" max="355" step="5" value="0"/><span class="val-unit">°</span></span></div><input type="range" id="sl-d" min="0" max="355" step="5" value="0"/><div class="sl-ticks"><span>E</span><span>N/S</span><span>W</span></div></div>
     <div class="divider"><span>Legenda</span></div>
     <div class="legend">
       <div class="palette-row">
@@ -686,7 +732,7 @@ document.getElementById('root').innerHTML = `
       <div class="legend-labels"><span>Bloqueado (perto)</span><span>Livre (longe)</span></div>
     </div>
   </div>
-  <footer class="ftr"><p>Estilo Ladybug · Turf.js · Giraffe iFrame SDK · <strong style="color:#00ACCD">v25</strong></p></footer>
+  <footer class="ftr"><p>Estilo Ladybug · Turf.js · Giraffe iFrame SDK · <strong style="color:#00ACCD">v26</strong></p></footer>
 </div>`;
 
 // ── Wire ─────────────────────────────────────────────────────────────────────
@@ -696,10 +742,47 @@ document.getElementById('btn-clear').addEventListener('click', clearAll);
 document.getElementById('toggle-obs').addEventListener('click', function () { S.useObs = !S.useObs; this.className = 'toggle' + (S.useObs ? ' on' : ''); scheduleRecompute(); });
 document.getElementById('toggle-osm').addEventListener('click', function () { S.useOSM = !S.useOSM; this.className = 'toggle' + (S.useOSM ? ' on' : ''); scheduleRecompute(); });
 document.getElementById('toggle-perm').addEventListener('click', function () { S.permanent = !S.permanent; this.className = 'toggle' + (S.permanent ? ' on' : ''); scheduleRecompute(); });
-document.getElementById('sl-h').addEventListener('input', e => { S.observerHeight = +e.target.value; document.getElementById('lbl-h').textContent = S.observerHeight + 'm'; scheduleRecompute(); });
-document.getElementById('sl-r').addEventListener('input', e => { S.radius = +e.target.value; document.getElementById('lbl-r').textContent = S.radius + 'm'; scheduleRecompute(); });
-document.getElementById('sl-c').addEventListener('input', e => { S.cone = +e.target.value; document.getElementById('lbl-c').textContent = S.cone >= 359.9 ? '360° (View Rose)' : S.cone + '°'; document.getElementById('grp-dir').style.display = S.cone >= 359.9 ? 'none' : ''; scheduleRecompute(); });
-document.getElementById('sl-d').addEventListener('input', e => { S.coneDir = +e.target.value; document.getElementById('lbl-d').textContent = S.coneDir + '°'; scheduleRecompute(); });
+// Sliders + inputs numéricos (bidirecional)
+function wireControl(key, setter, extra) {
+  const sl = document.getElementById('sl-' + key);
+  const num = document.getElementById('num-' + key);
+  sl.addEventListener('input', e => {
+    const v = +e.target.value; setter(v); num.value = v;
+    if (extra) extra(v); scheduleRecompute();
+  });
+  num.addEventListener('change', e => {
+    let v = +e.target.value;
+    const mn = +num.min, mx = +num.max;
+    if (isNaN(v)) v = mn; v = Math.max(mn, Math.min(mx, v));
+    setter(v); num.value = v; sl.value = v;
+    if (extra) extra(v); scheduleRecompute();
+  });
+}
+wireControl('h', v => S.observerHeight = v);
+wireControl('r', v => S.radius = v);
+wireControl('c', v => { S.cone = v; }, v => {
+  document.getElementById('grp-dir').style.display = v >= 359.9 ? 'none' : '';
+});
+wireControl('d', v => S.coneDir = v);
+
+// Botão refazer análise: força re-leitura de obstáculos e OSM
+document.getElementById('btn-redo').addEventListener('click', async () => {
+  if (!S.observer || S.status === 'compute') return;
+  osmCache.center = null; // força re-fetch do OSM
+  // Se o observador veio de um elemento, re-lê a posição/altura atual dele
+  if (S.observerFeatId) {
+    let raw = giraffeState.get('rawSections') || [];
+    if (!Array.isArray(raw)) raw = raw.features || Object.values(raw) || [];
+    const cur = raw.find(rf => rf?.properties?.id === S.observerFeatId);
+    if (cur) {
+      S.observer = turf.centroid(cur).geometry.coordinates;
+      const bh = Number(cur.properties?._baseHeight) || 0;
+      if (bh) { S.observerHeight = bh; syncControl('h', Math.round(bh)); }
+      renderObs();
+    }
+  }
+  await runCompute();
+});
 
 // Legenda renderizada diretamente no HTML (sem cards dinâmicos)
 
@@ -720,7 +803,11 @@ palSel.addEventListener('change', e => {
 
 giraffeState.addListener(['mapSelectCoord'], async () => {
   if (!isListening) return; const c = giraffeState.get('mapSelectCoord'); if (!c) return;
-  isListening = false; S.observer = Array.isArray(c) ? c : [c.lng, c.lat]; S.observerLabel = 'Ponto no mapa'; S.observerFeatId = null; S.observerHeight = 0; renderObs(); await runCompute();
+  isListening = false; S.observer = Array.isArray(c) ? c : [c.lng, c.lat]; S.observerLabel = 'Ponto no mapa'; S.observerFeatId = null;
+  const inh = inheritPointHeight(S.observer);
+  S.observerHeight = inh !== null ? inh : 0;
+  if (inh !== null) syncControl('h', Math.round(inh));
+  renderObs(); await runCompute();
 });
 giraffeState.addListener(['rawSections'], renderInfo);
 renderInfo();
