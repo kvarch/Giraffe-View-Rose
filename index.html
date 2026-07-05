@@ -520,8 +520,8 @@ async function renderPermanent(obs, wedges, h) {
         layerId: 'default',        // obrigatório para importRawSections
         sp_tag: SP_TAG,            // marcador para deleção idempotente
         color: color,
-        _baseHeight: h,
-        _height: 0.5,
+        baseHeight: h,             // propriedade NATIVA do Giraffe (Base Height)
+        height: 0.5,               // propriedade NATIVA (Height) — espessura da fatia
         stroke: color,
         'stroke-opacity': 0.9,
       };
@@ -732,7 +732,7 @@ document.getElementById('root').innerHTML = `
       <div class="legend-labels"><span>Bloqueado (perto)</span><span>Livre (longe)</span></div>
     </div>
   </div>
-  <footer class="ftr"><p>Estilo Ladybug · Turf.js · Giraffe iFrame SDK · <strong style="color:#00ACCD">v26</strong></p></footer>
+  <footer class="ftr"><p>Estilo Ladybug · Turf.js · Giraffe iFrame SDK · <strong style="color:#00ACCD">v27</strong></p></footer>
 </div>`;
 
 // ── Wire ─────────────────────────────────────────────────────────────────────
