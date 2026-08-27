@@ -538,8 +538,8 @@ function castRaysTurf(obsCoord, radiusM, coneAngle, coneDir, obstacles, observer
     
     const buildingTop = baseHeight + height;
 
-    // Se o edifício não tem altura definida, assume que obstrui (segurança)
-    if (buildingTop === 0) return true;
+    // Elementos sem altura definida (lotes, linhas, pontos 2D) → não obstruem
+    if (buildingTop === 0) return false;
     return buildingTop > observerHeight;
   });
 
@@ -684,7 +684,8 @@ async function compute() {
         height = p._levels * p._floorToFloor;
       }
       const buildingTop = baseHeight + height;
-      if (buildingTop === 0) return true;
+      // Elementos sem altura definida (lotes, linhas, pontos 2D) → não obstruem
+      if (buildingTop === 0) return false;
       return buildingTop > obsH;
     });
     polys = flattenToPolygons(tall);
