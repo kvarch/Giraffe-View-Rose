@@ -409,8 +409,8 @@ const S = {
   observer: null, observerLabel: '', observerFeatId: null,
   observerHeight: 0,  // altura do ponto de observação (metros)
   radius: 300, cone: 360, coneDir: 0,
-  useObs: false,
-  useOSM: false,        // incluir edifícios do mapa base (OSM)
+  useObs: true,
+  useOSM: true,        // incluir edifícios do mapa base (OSM)
   permanent: false,     // renderizar em layer permanente (rawSections)
   bands: [
     { label: 'Próximo',  dist: 100, color: '#00ACCD', opacity: 0.55 },
@@ -744,10 +744,8 @@ async function compute() {
     // Para não pesar o modelo, agrupa fatias consecutivas de cor semelhante
     // (12 buckets) em polígonos-leque únicos — reduz ~180 fatias para ~15-30.
     await renderPermanent(obs, wedgeFeatures, h);
-    // Limpa as camadas temporárias se existirem
+    // Limpa a layer temporária se existir (modo trocado)
     try { await rpc.invoke('removeTempLayer', [`${LO}_rose`]); } catch {}
-    try { await rpc.invoke('removeTempLayer', [`${LO}_edge`]); } catch {}
-    try { await rpc.invoke('removeTempLayer', [`${LO}_obs`]); } catch {}
   } else {
     // ── Modo temporário (padrão): rápido, some ao fechar o projeto ───────────
     const fc = { type: 'FeatureCollection', features: wedgeFeatures };
@@ -761,39 +759,36 @@ async function compute() {
         'fill-extrusion-translate-anchor': 'map'
       }
     });
-    await renderLayer(`${LO}_edge`, fc, {
-      type: 'line',
-      paint: { 'line-color': ['get', 'color'], 'line-width': 0.5, 'line-opacity': 0.4 }
-    });
-    await renderLayer(`${LO}_obs`, { type:'FeatureCollection', features:[turf.point(obs)] }, {
-      type: 'circle',
-      paint: { 'circle-color': '#fff', 'circle-radius': 5, 'circle-stroke-color': '#000', 'circle-stroke-width': 2 }
-    });
-    // Remove seções permanentes antigas se o usuário desligou o modo
-    await deletePermanentSections();
   }
 
   return wedgeFeatures.length;
 }
 
-// ─── Modo permanente: seções reais com sp_tag para atualização idempotente ────
+// ─── Modo permanente: seções reais com sp_tag por ponto de observação ───────
+// sp_tag inclui as coordenadas do observador arredondadas a 5 casas decimais.
+// Isso garante: mesma posição → substitui (apaga análise anterior desse ponto);
+//               posição nova  → acumula (preserva todas as outras análises).
 const SP_TAG = 'isovist_rose';
 
-async function deletePermanentSections() {
+function obsTag(obs) {
+  return `${SP_TAG}_${obs[0].toFixed(5)}_${obs[1].toFixed(5)}`;
+}
+
+async function deleteObsSections(tag) {
   try {
     let raw = giraffeState.get('rawSections') || [];
     if (!Array.isArray(raw)) raw = raw.features || Object.values(raw) || [];
     const ids = raw
-      .filter(f => f?.properties?.sp_tag === SP_TAG)
+      .filter(f => f?.properties?.sp_tag === tag)
       .map(f => f.properties?.id || f.id)
       .filter(Boolean);
-    if (ids.length > 0) {
-      await rpc.invoke('deleteRawSections', [ids]);
-    }
-  } catch(e) { console.warn('[Isovist] deletePermanentSections:', e); }
+    if (ids.length > 0) await rpc.invoke('deleteRawSections', [ids]);
+  } catch(e) { console.warn('[Isovist] deleteObsSections:', e); }
 }
 
 async function renderPermanent(obs, wedges, h) {
+  const tag = obsTag(obs); // tag único por ponto de observação
+
   // 1. Agrupar wedges consecutivos por bucket de cor (12 níveis)
   const BUCKETS = 12;
   const groups = [];
@@ -802,12 +797,10 @@ async function renderPermanent(obs, wedges, h) {
   for (const w of wedges) {
     const bucket = Math.min(BUCKETS - 1, Math.floor(w.properties.dist_ratio * BUCKETS));
     if (cur && cur.bucket === bucket) {
-      // Estende o leque atual: adiciona a ponta nova
-      cur.tips.push(w.geometry.coordinates[0][2]); // tipCoord do wedge
+      cur.tips.push(w.geometry.coordinates[0][2]);
       cur.ratios.push(w.properties.dist_ratio);
     } else {
       if (cur) groups.push(cur);
-      // wedge coords: [obs, prevTip, tipCoord, obs]
       cur = {
         bucket,
         tips: [w.geometry.coordinates[0][1], w.geometry.coordinates[0][2]],
@@ -825,11 +818,11 @@ async function renderPermanent(obs, wedges, h) {
     try {
       const fan = turf.polygon([[obs, ...g.tips, obs]]);
       fan.properties = {
-        layerId: 'default',        // obrigatório para importRawSections
-        sp_tag: SP_TAG,            // marcador para deleção idempotente
+        layerId: 'default',
+        sp_tag: tag,               // tag por ponto → permite substituição cirúrgica
         color: color,
-        baseHeight: h,             // propriedade NATIVA do Giraffe (Base Height)
-        height: 0.5,               // propriedade NATIVA (Height) — espessura da fatia
+        baseHeight: h,
+        height: 0.5,
         stroke: color,
         'stroke-opacity': 0.9,
       };
@@ -837,11 +830,11 @@ async function renderPermanent(obs, wedges, h) {
     } catch {}
   }
 
-  // 3. Deletar seções antigas e criar as novas
-  await deletePermanentSections();
+  // 3. Apagar só a análise desse ponto e recriar (outros pontos intocados)
+  await deleteObsSections(tag);
   try {
     await rpc.invoke('createRawSections', [sectionFeatures]);
-    console.log(`[Isovist] ${sectionFeatures.length} seções permanentes criadas (de ${wedges.length} fatias)`);
+    console.log(`[Isovist] ${sectionFeatures.length} seções criadas para tag ${tag}`);
   } catch(e) {
     console.error('[Isovist] createRawSections:', e);
     setStatus('error', 'Falha ao criar seções permanentes: ' + e);
@@ -850,9 +843,7 @@ async function renderPermanent(obs, wedges, h) {
 
 async function clearLayers() {
   try { await rpc.invoke('removeTempLayer', [`${LO}_rose`]); } catch {}
-  try { await rpc.invoke('removeTempLayer', [`${LO}_edge`]); } catch {}
-  try { await rpc.invoke('removeTempLayer', [`${LO}_obs`]); } catch {}
-  await deletePermanentSections();
+  // Seções permanentes (rawSections) são preservadas — só removíveis manualmente no Giraffe
 }
 
 // ─── UI ───────────────────────────────────────────────────────────────────────
@@ -1033,8 +1024,8 @@ document.getElementById('root').innerHTML = `
     <button class="btn btn-primary" id="btn-redo" aria-label="Refazer análise" style="display:none">↻ Refazer análise</button>
     <button class="btn btn-clear" id="btn-clear" aria-label="Limpar análise" style="display:none">✕ Limpar análise</button>
     <div class="divider"><span>Obstruções</span></div>
-    <div class="toggle-row"><button class="toggle" id="toggle-obs" aria-label="Ativar raycasting contra edifícios" role="switch" aria-checked="false"></button><span class="toggle-label">Raycasting contra edifícios</span></div>
-    <div class="toggle-row"><button class="toggle" id="toggle-osm" aria-label="Incluir edifícios OSM" role="switch" aria-checked="false"></button><span class="toggle-label">Incluir edifícios do mapa base (OSM)</span></div>
+    <div class="toggle-row"><button class="toggle" id="toggle-obs" aria-label="Ativar raycasting contra edifícios" role="switch" aria-checked="true"></button><span class="toggle-label">Raycasting contra edifícios</span></div>
+    <div class="toggle-row"><button class="toggle" id="toggle-osm" aria-label="Incluir edifícios OSM" role="switch" aria-checked="true"></button><span class="toggle-label">Incluir edifícios do mapa base (OSM)</span></div>
     <div class="info-box" id="info-obs">—</div>
     <div class="divider"><span>Saída</span></div>
     <div class="toggle-row"><button class="toggle" id="toggle-perm" aria-label="Ativar layer permanente" role="switch" aria-checked="false"></button><span class="toggle-label">Layer permanente (salvo no projeto)</span></div>
@@ -1052,15 +1043,18 @@ document.getElementById('root').innerHTML = `
       <div class="legend-labels"><span>Bloqueado (perto)</span><span>Livre (longe)</span></div>
     </div>
   </div>
-  <footer class="ftr"><p>Beta V30 · © 2026 Königsberger Vannucchi</p></footer>
+  <footer class="ftr"><p>Beta V35 · © 2026 Königsberger Vannucchi</p></footer>
 </div>`;
 
 // ── Wire ─────────────────────────────────────────────────────────────────────
 document.getElementById('btn-sel').addEventListener('click', fromSel);
 document.getElementById('btn-point').addEventListener('click', fromMap);
 document.getElementById('btn-clear').addEventListener('click', clearAll);
-document.getElementById('toggle-obs').addEventListener('click', function () { S.useObs = !S.useObs; this.className = 'toggle' + (S.useObs ? ' on' : ''); scheduleRecompute(); });
-document.getElementById('toggle-osm').addEventListener('click', function () { S.useOSM = !S.useOSM; this.className = 'toggle' + (S.useOSM ? ' on' : ''); scheduleRecompute(); });
+document.getElementById('toggle-obs').addEventListener('click', function () { S.useObs = !S.useObs; this.className = 'toggle' + (S.useObs ? ' on' : ''); this.setAttribute('aria-checked', S.useObs); scheduleRecompute(); });
+document.getElementById('toggle-osm').addEventListener('click', function () { S.useOSM = !S.useOSM; this.className = 'toggle' + (S.useOSM ? ' on' : ''); this.setAttribute('aria-checked', S.useOSM); scheduleRecompute(); });
+// Inicializar classe visual dos toggles conforme estado padrão
+document.getElementById('toggle-obs').className = 'toggle' + (S.useObs ? ' on' : '');
+document.getElementById('toggle-osm').className = 'toggle' + (S.useOSM ? ' on' : '');
 document.getElementById('toggle-perm').addEventListener('click', function () { S.permanent = !S.permanent; this.className = 'toggle' + (S.permanent ? ' on' : ''); scheduleRecompute(); });
 // Sliders + inputs numéricos (bidirecional)
 function wireControl(key, setter, extra) {
