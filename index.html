@@ -404,6 +404,7 @@ import * as turf              from 'https://esm.sh/@turf/turf@6.5.0';
 
 const LO = 'isov';
 const RAY_STEP = 2;
+const SP_TAG = 'isovist_rose';   // marcador das rosas permanentes (usado em getObstacles e renderPermanent)
 
 const S = {
   observer: null, observerLabel: '', observerFeatId: null,
@@ -436,6 +437,11 @@ function getObstacles(excludeId) {
     if (!f?.geometry) return false;
     const t = f.geometry.type;
     if (t !== 'Polygon' && t !== 'MultiPolygon') return false;
+    // Excluir outputs do próprio isovist (rosas permanentes de análises anteriores).
+    // As seções permanentes usam layerId 'default' (obrigatório para createRawSections),
+    // então o marcador confiável é o sp_tag, que começa sempre com 'isovist_rose'.
+    const tag = f.properties?.sp_tag || '';
+    if (tag.startsWith(SP_TAG)) return false;
     if ((f.properties?.layerId || '').startsWith(LO)) return false;
     if (excludeId && f.properties?.id === excludeId) return false;
     return true;
@@ -763,7 +769,7 @@ async function compute() {
 // sp_tag inclui as coordenadas do observador arredondadas a 5 casas decimais.
 // Isso garante: mesma posição → substitui (apaga análise anterior desse ponto);
 //               posição nova  → acumula (preserva todas as outras análises).
-const SP_TAG = 'isovist_rose';
+// (SP_TAG declarado no topo, junto das constantes globais)
 
 function obsTag(obs) {
   return `${SP_TAG}_${obs[0].toFixed(5)}_${obs[1].toFixed(5)}`;
@@ -1038,7 +1044,7 @@ document.getElementById('root').innerHTML = `
       <div class="legend-labels"><span>Bloqueado (perto)</span><span>Livre (longe)</span></div>
     </div>
   </div>
-  <footer class="ftr"><p>Beta V36 · © 2026 Königsberger Vannucchi</p></footer>
+  <footer class="ftr"><p>Beta V37 · © 2026 Königsberger Vannucchi</p></footer>
 </div>`;
 
 // ── Wire ─────────────────────────────────────────────────────────────────────
