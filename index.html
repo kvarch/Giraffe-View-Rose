@@ -510,6 +510,38 @@ function paletteToGradientCSS(key) {
   }).join(',') + ')';
 }
 // ─── Raycasting Turf.js puro ──────────────────────────────────────────────────
+// ─── Altura do topo do obstáculo (elevação absoluta em metros) ────────────────
+// IMPORTANTE: `_height` nas features AVALIADAS do Giraffe já é o topo absoluto
+// (inclui o offset de base/stack). Somar `_baseHeight` a ele duplica a altura e
+// faz edifícios parecerem muito mais altos do que são — era a causa da rosa
+// distorcida quando o observador ficava abaixo da base dos edifícios.
+// Já `height` (propriedade nativa, sem underscore) é altura RELATIVA à base.
+function getBuildingTop(f) {
+  const p = f.properties || {};
+  const base = p._baseHeight ?? p.baseHeight ?? 0;
+
+  // 1. Feature avaliada: _height é ABSOLUTO — usar direto, sem somar base
+  if (p._height !== undefined && p._height !== null) {
+    return p._height;
+  }
+
+  // 2. Propriedade nativa: height é RELATIVO à base
+  if (p.height !== undefined && p.height !== null) {
+    return base + p.height;
+  }
+
+  // 3. Derivado de pavimentos: também RELATIVO à base
+  if (p.levels !== undefined && p.floorToFloor !== undefined) {
+    return base + (p.levels * p.floorToFloor);
+  }
+  if (p._levels !== undefined && p._floorToFloor !== undefined) {
+    return base + (p._levels * p._floorToFloor);
+  }
+
+  // 4. Sem dado de altura (lotes, linhas, pontos 2D) → não obstrui
+  return 0;
+}
+
 function castRaysTurf(obsCoord, radiusM, coneAngle, coneDir, obstacles, observerHeight) {
   const is360    = coneAngle >= 359.9;
   const half     = coneAngle / 2;
@@ -519,29 +551,7 @@ function castRaysTurf(obsCoord, radiusM, coneAngle, coneDir, obstacles, observer
   const obsP     = turf.point(obsCoord);
 
   // Filtrar: só obstáculos mais altos que o observador bloqueiam a visão
- const tallEnough = obstacles.filter(f => {
-    const p = f.properties || {};
-    
-    // 1. Captura a elevação base da implantação (funciona para ambos)
-    const baseHeight = p._baseHeight || p.baseHeight || 0; 
-    
-    // 2. Lógica avançada para extrair a altura real do edifício (Metros vs Pisos)
-    let height = 0;
-    if (p._height !== undefined || p.height !== undefined) {
-      height = p._height ?? p.height;
-    } else if (p.levels !== undefined && p.floorToFloor !== undefined) {
-      // Se for um edifício baseado em pisos, calcula: pavimentos * altura do piso
-      height = p.levels * p.floorToFloor;
-    } else if (p._levels !== undefined && p._floorToFloor !== undefined) {
-      height = p._levels * p._floorToFloor;
-    }
-    
-    const buildingTop = baseHeight + height;
-
-    // Elementos sem altura definida (lotes, linhas, pontos 2D) → não obstruem
-    if (buildingTop === 0) return false;
-    return buildingTop > observerHeight;
-  });
+  const tallEnough = obstacles.filter(f => getBuildingTop(f) > observerHeight);
 
   const polys = flattenToPolygons(tallEnough);
   const tips  = [];
@@ -671,23 +681,8 @@ async function compute() {
       obstacles = obstacles.concat(osmFeats);
     }
     S.obstCount = obstacles.length;
-    // Usa a mesma lógica de altura do castRaysTurf (levels * floorToFloor)
-    const tall = obstacles.filter(f => {
-      const p = f.properties || {};
-      const baseHeight = p._baseHeight || p.baseHeight || 0;
-      let height = 0;
-      if (p._height !== undefined || p.height !== undefined) {
-        height = p._height ?? p.height;
-      } else if (p.levels !== undefined && p.floorToFloor !== undefined) {
-        height = p.levels * p.floorToFloor;
-      } else if (p._levels !== undefined && p._floorToFloor !== undefined) {
-        height = p._levels * p._floorToFloor;
-      }
-      const buildingTop = baseHeight + height;
-      // Elementos sem altura definida (lotes, linhas, pontos 2D) → não obstruem
-      if (buildingTop === 0) return false;
-      return buildingTop > obsH;
-    });
+    // Mesma lógica de altura do castRaysTurf (getBuildingTop compartilhado)
+    const tall = obstacles.filter(f => getBuildingTop(f) > obsH);
     polys = flattenToPolygons(tall);
     setStatus('compute', `Raycasting contra ${polys.length} obstáculos...`);
   }
@@ -1043,7 +1038,7 @@ document.getElementById('root').innerHTML = `
       <div class="legend-labels"><span>Bloqueado (perto)</span><span>Livre (longe)</span></div>
     </div>
   </div>
-  <footer class="ftr"><p>Beta V35 · © 2026 Königsberger Vannucchi</p></footer>
+  <footer class="ftr"><p>Beta V36 · © 2026 Königsberger Vannucchi</p></footer>
 </div>`;
 
 // ── Wire ─────────────────────────────────────────────────────────────────────
