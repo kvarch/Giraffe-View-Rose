@@ -411,7 +411,8 @@ const S = {
   observerHeight: 0,  // altura do ponto de observação (metros)
   radius: 300, cone: 360, coneDir: 0,
   useObs: true,
-  useOSM: true,        // incluir edifícios do mapa base (OSM)
+  useOSM: true,
+  onlyVisible: true,   // ignorar elementos em layers ocultos        // incluir edifícios do mapa base (OSM)
   permanent: false,     // renderizar em layer permanente (rawSections)
   bands: [
     { label: 'Próximo',  dist: 100, color: '#00ACCD', opacity: 0.55 },
@@ -425,6 +426,55 @@ const osmCache = { center: null, radius: 0, features: [] };
 let isListening = false, debounce = null;
 
 // ─── Obter obstáculos ─────────────────────────────────────────────────────────
+// ─── Visibilidade de drawing layers ───────────────────────────────────────────
+// O SDK expõe changeLayerVisibility (setter) mas não documenta um getter.
+// Sondamos as chaves prováveis do giraffeState; se nenhuma existir, o filtro
+// é desligado (fail-open) para nunca quebrar a análise.
+const HIDDEN_LAYER_KEYS = [
+  'drawingLayers', 'projectLayers', 'layers', 'layerVisibility', 'layerGroups'
+];
+
+function getHiddenLayerNames() {
+  for (const key of HIDDEN_LAYER_KEYS) {
+    let v;
+    try { v = giraffeState.get(key); } catch { continue; }
+    if (!v) continue;
+
+    let list = Array.isArray(v) ? v : (v.layers || Object.values(v));
+    if (!Array.isArray(list) || !list.length) continue;
+
+    const hidden = [];
+    for (const l of list) {
+      if (!l || typeof l !== 'object') continue;
+      const name = l.name ?? l.id ?? l.layerId ?? l.layer;
+      // aceita visible:false, hidden:true, display:'none'
+      const isHidden = l.visible === false || l.hidden === true || l.display === 'none';
+      if (name && isHidden) hidden.push(name);
+    }
+    if (hidden.length) {
+      console.log(`[Isovist] layers ocultos via '${key}':`, hidden);
+      return new Set(hidden);
+    }
+    // chave existe e é válida, mas nada oculto
+    if (list.some(l => l && typeof l === 'object' && ('visible' in l || 'hidden' in l))) {
+      return new Set();
+    }
+  }
+  return null; // nenhuma chave utilizável → filtro desligado
+}
+
+// Diagnóstico: lista as chaves do giraffeState para descobrir onde vive a
+// visibilidade de layers neste build do Giraffe. Rode window.isovistDebugLayers()
+window.isovistDebugLayers = function () {
+  try {
+    const keys = Object.keys(giraffeState.attr || {});
+    console.log('[Isovist] chaves do giraffeState:', keys);
+    for (const k of keys) {
+      if (/layer/i.test(k)) console.log(`  ${k} =`, giraffeState.get(k));
+    }
+  } catch (e) { console.warn('[Isovist] debug falhou:', e); }
+};
+
 function getObstacles(excludeId) {
   let raw = giraffeState.get('rawSections');
   if (!raw) return [];
@@ -433,6 +483,9 @@ function getObstacles(excludeId) {
     else if (typeof raw === 'object') { try { raw = Object.values(raw); } catch { return []; } }
     else return [];
   }
+  // Layers ocultos: null = não foi possível detectar → filtro desligado
+  const hidden = S.onlyVisible ? getHiddenLayerNames() : null;
+
   return raw.filter(f => {
     if (!f?.geometry) return false;
     const t = f.geometry.type;
@@ -443,6 +496,11 @@ function getObstacles(excludeId) {
     const tag = f.properties?.sp_tag || '';
     if (tag.startsWith(SP_TAG)) return false;
     if ((f.properties?.layerId || '').startsWith(LO)) return false;
+    // Ignorar elementos em drawing layers ocultos
+    if (hidden && hidden.size) {
+      const lid = f.properties?.layerId;
+      if (lid && hidden.has(lid)) return false;
+    }
     if (excludeId && f.properties?.id === excludeId) return false;
     return true;
   });
@@ -577,6 +635,46 @@ function getBuildingTop(f) {
   return 0;
 }
 
+// ─── Base do obstáculo (elevação inferior em metros) ──────────────────────────
+// Necessário porque um elemento flutuante (trajetória solar, rosas anteriores,
+// marquises, passarelas) NÃO bloqueia um raio horizontal que passa abaixo dele.
+function getBuildingBase(f) {
+  const p = f.properties || {};
+
+  // Elementos com patch (ex.: Sun Path 3D) carregam o Z no array patch
+  if (Array.isArray(p.patch) && p.patch.length) {
+    const zs = p.patch.filter(z => Number.isFinite(Number(z))).map(Number);
+    if (zs.length) return Math.min(...zs);
+  }
+
+  return p._baseHeight ?? p.baseHeight ?? 0;
+}
+
+// ─── O elemento cruza o plano horizontal da linha de visão? ───────────────────
+// Um raio sai do olho do observador na horizontal. Só é bloqueado por elementos
+// cuja extensão vertical contém essa altura: base <= olho < topo.
+// Isso descarta tanto o que está inteiramente acima quanto abaixo do observador.
+function blocksAtHeight(f, eyeHeight) {
+  const p = f.properties || {};
+
+  // Elementos com patch (Sun Path 3D e afins): extensão vertical vem do patch
+  if (Array.isArray(p.patch) && p.patch.length) {
+    const zs = p.patch.filter(z => Number.isFinite(Number(z))).map(Number);
+    if (zs.length) {
+      const patchBase = Math.min(...zs);
+      const patchTop  = Math.max(...zs) + (Number(p.height) || 0.5);
+      return patchBase <= eyeHeight && patchTop > eyeHeight;
+    }
+  }
+
+  const top = getBuildingTop(f);
+  if (top <= 0) return false;            // sem altura → não obstrui
+
+  let base = getBuildingBase(f);
+  if (base > top) base = 0;              // dado inconsistente → assume térreo
+  return base <= eyeHeight && top > eyeHeight;
+}
+
 function castRaysTurf(obsCoord, radiusM, coneAngle, coneDir, obstacles, observerHeight) {
   const is360    = coneAngle >= 359.9;
   const half     = coneAngle / 2;
@@ -586,7 +684,7 @@ function castRaysTurf(obsCoord, radiusM, coneAngle, coneDir, obstacles, observer
   const obsP     = turf.point(obsCoord);
 
   // Filtrar: só obstáculos mais altos que o observador bloqueiam a visão
-  const tallEnough = obstacles.filter(f => getBuildingTop(f) > observerHeight);
+  const tallEnough = obstacles.filter(f => blocksAtHeight(f, observerHeight));
 
   const polys = flattenToPolygons(tallEnough);
   const tips  = [];
@@ -717,7 +815,7 @@ async function compute() {
     }
     S.obstCount = obstacles.length;
     // Mesma lógica de altura do castRaysTurf (getBuildingTop compartilhado)
-    const tall = obstacles.filter(f => getBuildingTop(f) > obsH);
+    const tall = obstacles.filter(f => blocksAtHeight(f, obsH));
     polys = flattenToPolygons(tall);
     setStatus('compute', `Raycasting contra ${polys.length} obstáculos...`);
   }
@@ -1056,6 +1154,7 @@ document.getElementById('root').innerHTML = `
     <div class="divider"><span>Obstruções</span></div>
     <div class="toggle-row"><button class="toggle" id="toggle-obs" aria-label="Ativar raycasting contra edifícios" role="switch" aria-checked="true"></button><span class="toggle-label">Raycasting contra edifícios</span></div>
     <div class="toggle-row"><button class="toggle" id="toggle-osm" aria-label="Incluir edifícios OSM" role="switch" aria-checked="true"></button><span class="toggle-label">Incluir edifícios do mapa base (OSM)</span></div>
+    <div class="toggle-row"><button class="toggle" id="toggle-vis" aria-label="Ignorar elementos em layers ocultos" role="switch" aria-checked="true"></button><span class="toggle-label">Ignorar layers ocultos</span></div>
     <div class="info-box" id="info-obs">—</div>
     <div class="divider"><span>Saída</span></div>
     <div class="toggle-row"><button class="toggle" id="toggle-perm" aria-label="Ativar layer permanente" role="switch" aria-checked="false"></button><span class="toggle-label">Layer permanente (salvo no projeto)</span></div>
@@ -1073,7 +1172,7 @@ document.getElementById('root').innerHTML = `
       <div class="legend-labels"><span>Bloqueado (perto)</span><span>Livre (longe)</span></div>
     </div>
   </div>
-  <footer class="ftr"><p>Beta V38 · © 2026 Königsberger Vannucchi</p></footer>
+  <footer class="ftr"><p>Beta V39 · © 2026 Königsberger Vannucchi</p></footer>
 </div>`;
 
 // ── Wire ─────────────────────────────────────────────────────────────────────
@@ -1085,6 +1184,8 @@ document.getElementById('toggle-osm').addEventListener('click', function () { S.
 // Inicializar classe visual dos toggles conforme estado padrão
 document.getElementById('toggle-obs').className = 'toggle' + (S.useObs ? ' on' : '');
 document.getElementById('toggle-osm').className = 'toggle' + (S.useOSM ? ' on' : '');
+document.getElementById('toggle-vis').addEventListener('click', function () { S.onlyVisible = !S.onlyVisible; this.className = 'toggle' + (S.onlyVisible ? ' on' : ''); this.setAttribute('aria-checked', S.onlyVisible); scheduleRecompute(); });
+document.getElementById('toggle-vis').className = 'toggle' + (S.onlyVisible ? ' on' : '');
 document.getElementById('toggle-perm').addEventListener('click', function () { S.permanent = !S.permanent; this.className = 'toggle' + (S.permanent ? ' on' : ''); scheduleRecompute(); });
 // Sliders + inputs numéricos (bidirecional)
 function wireControl(key, setter, extra) {
