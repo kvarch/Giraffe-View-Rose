@@ -427,54 +427,61 @@ const osmCache = { center: null, radius: 0, features: [] };
 let isListening = false, debounce = null;
 
 // ─── Obter obstáculos ─────────────────────────────────────────────────────────
-// ─── Visibilidade de drawing layers ───────────────────────────────────────────
-// O SDK expõe changeLayerVisibility (setter) mas não documenta um getter.
-// Sondamos as chaves prováveis do giraffeState; se nenhuma existir, o filtro
-// é desligado (fail-open) para nunca quebrar a análise.
-const HIDDEN_LAYER_KEYS = [
-  'drawingLayers', 'projectLayers', 'layers', 'layerVisibility', 'layerGroups'
-];
+// ─── Visibilidade de drawing layers (via layerTree) ──────────────────────────
+// O giraffeState expõe 'layerTree': uma árvore hierárquica onde os drawing
+// layers aparecem como "GIRDRW-<n>:<nome do layer>-<tipo>" (ex.: -fill, -line)
+// e os grupos (BASES, MODELAGEM, LEGAL...) carregam data.enabled.
+// A visibilidade é HERDADA: se um grupo pai está desligado, tudo dentro dele
+// está oculto, mesmo que o enabled do próprio layer seja true.
+const GIRDRW_RE = /^GIRDRW-\d+:(.+?)-(fill|line|circle|symbol|extrusion|icon|text|point)$/;
 
-function getHiddenLayerNames() {
-  for (const key of HIDDEN_LAYER_KEYS) {
-    let v;
-    try { v = giraffeState.get(key); } catch { continue; }
-    if (!v) continue;
-
-    let list = Array.isArray(v) ? v : (v.layers || Object.values(v));
-    if (!Array.isArray(list) || !list.length) continue;
-
-    const hidden = [];
-    for (const l of list) {
-      if (!l || typeof l !== 'object') continue;
-      const name = l.name ?? l.id ?? l.layerId ?? l.layer;
-      // aceita visible:false, hidden:true, display:'none'
-      const isHidden = l.visible === false || l.hidden === true || l.display === 'none';
-      if (name && isHidden) hidden.push(name);
-    }
-    if (hidden.length) {
-      console.log(`[Isovist] layers ocultos via '${key}':`, hidden);
-      return new Set(hidden);
-    }
-    // chave existe e é válida, mas nada oculto
-    if (list.some(l => l && typeof l === 'object' && ('visible' in l || 'hidden' in l))) {
-      return new Set();
-    }
-  }
-  return null; // nenhuma chave utilizável → filtro desligado
+// Um nó está habilitado a menos que diga explicitamente o contrário.
+function nodeEnabled(node) {
+  if (!node || typeof node !== 'object') return true;
+  const d = node.data || {};
+  if (d.enabled === false || d.visible === false || d.hidden === true) return false;
+  if (node.enabled === false || node.visible === false || node.hidden === true) return false;
+  return true;
 }
 
-// Diagnóstico: lista as chaves do giraffeState para descobrir onde vive a
-// visibilidade de layers neste build do Giraffe. Rode window.isovistDebugLayers()
-window.isovistDebugLayers = function () {
-  try {
-    const keys = Object.keys(giraffeState.attr || {});
-    console.log('[Isovist] chaves do giraffeState:', keys);
-    for (const k of keys) {
-      if (/layer/i.test(k)) console.log(`  ${k} =`, giraffeState.get(k));
+// Retorna Set com os nomes dos drawing layers ocultos, ou null se a árvore
+// não estiver disponível (nesse caso o filtro automático fica desligado).
+function getHiddenLayerNames() {
+  let tree;
+  try { tree = giraffeState.get('layerTree'); } catch { return null; }
+  if (!tree || !tree.items || typeof tree.items !== 'object') return null;
+
+  const items = tree.items;
+
+  // Mapa filho -> pai, para subir a hierarquia
+  const parentOf = {};
+  for (const [id, node] of Object.entries(items)) {
+    for (const c of (node?.children || [])) parentOf[c] = id;
+  }
+
+  // Visível só se ele e todos os ancestrais estiverem habilitados
+  function visibleWithAncestors(id) {
+    let cur = id, guard = 0;
+    while (cur && guard++ < 64) {
+      if (!nodeEnabled(items[cur])) return false;
+      cur = parentOf[cur];
     }
-  } catch (e) { console.warn('[Isovist] debug falhou:', e); }
-};
+    return true;
+  }
+
+  // Para cada layer, o nó '-fill' manda (polígonos renderizam como fill).
+  const state = {};   // nome do layer -> visível?
+  for (const id of Object.keys(items)) {
+    const m = id.match(GIRDRW_RE);
+    if (!m) continue;
+    const name = m[1], kind = m[2];
+    const vis = visibleWithAncestors(id);
+    if (kind === 'fill' || !(name in state)) state[name] = vis;
+  }
+
+  const hidden = new Set(Object.entries(state).filter(([, v]) => !v).map(([n]) => n));
+  return hidden;
+}
 
 function getObstacles(excludeId) {
   let raw = giraffeState.get('rawSections');
@@ -1185,7 +1192,7 @@ document.getElementById('root').innerHTML = `
       <div class="legend-labels"><span>Bloqueado (perto)</span><span>Livre (longe)</span></div>
     </div>
   </div>
-  <footer class="ftr"><p>Beta V40 · © 2026 Königsberger Vannucchi</p></footer>
+  <footer class="ftr"><p>Beta V41 · © 2026 Königsberger Vannucchi</p></footer>
 </div>`;
 
 // ── Wire ─────────────────────────────────────────────────────────────────────
@@ -1197,7 +1204,7 @@ document.getElementById('toggle-osm').addEventListener('click', function () { S.
 // Inicializar classe visual dos toggles conforme estado padrão
 document.getElementById('toggle-obs').className = 'toggle' + (S.useObs ? ' on' : '');
 document.getElementById('toggle-osm').className = 'toggle' + (S.useOSM ? ' on' : '');
-document.getElementById('toggle-vis').addEventListener('click', function () { S.onlyVisible = !S.onlyVisible; this.className = 'toggle' + (S.onlyVisible ? ' on' : ''); this.setAttribute('aria-checked', S.onlyVisible); scheduleRecompute(); });
+document.getElementById('toggle-vis').addEventListener('click', function () { S.onlyVisible = !S.onlyVisible; this.className = 'toggle' + (S.onlyVisible ? ' on' : ''); this.setAttribute('aria-checked', S.onlyVisible); renderLayerList(); scheduleRecompute(); });
 document.getElementById('toggle-vis').className = 'toggle' + (S.onlyVisible ? ' on' : '');
 
 // ─── Lista de layers com checkbox de exclusão ────────────────────────────────
@@ -1219,6 +1226,7 @@ function listLayerIds() {
 function renderLayerList() {
   const box = document.getElementById('layer-list');
   const layers = listLayerIds();
+  const autoHidden = S.onlyVisible ? getHiddenLayerNames() : null;
   if (!layers.length) {
     box.innerHTML = '<div style="font-size:10px;color:var(--md-sys-color-outline)">Nenhum layer com polígonos encontrado.</div>';
     return;
@@ -1240,8 +1248,16 @@ function renderLayerList() {
     txt.style.cssText = 'flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
     txt.title = lid;
     const cnt = document.createElement('span');
-    cnt.textContent = n;
-    cnt.style.cssText = 'font-size:9px;color:var(--md-sys-color-outline);font-variant-numeric:tabular-nums';
+    const isAuto = autoHidden && autoHidden.has(lid);
+    cnt.textContent = isAuto ? 'oculto' : n;
+    cnt.style.cssText = 'font-size:9px;color:var(--md-sys-color-outline);font-variant-numeric:tabular-nums;flex-shrink:0';
+    if (isAuto) {
+      cnt.style.color = 'var(--kv-accent)';
+      txt.style.opacity = '.5';
+      txt.style.textDecoration = 'line-through';
+      cb.disabled = true;
+      row.title = 'Layer oculto no Giraffe — já ignorado automaticamente';
+    }
     row.append(cb, txt, cnt);
     box.appendChild(row);
   }
@@ -1255,33 +1271,51 @@ document.getElementById('btn-diag').addEventListener('click', () => {
   const out = document.getElementById('diag-out');
   const lines = [];
   try {
-    const keys = Object.keys(giraffeState.attr || {});
-    lines.push('CHAVES DO giraffeState:');
-    lines.push(keys.join(', ') || '(nenhuma)');
+    const hidden = getHiddenLayerNames();
+    lines.push('LAYERS OCULTOS DETECTADOS:');
+    if (hidden === null) lines.push('  (layerTree indisponível — filtro automático desligado)');
+    else if (!hidden.size) lines.push('  (nenhum)');
+    else for (const h of hidden) lines.push('  • ' + h);
     lines.push('');
-    const layerKeys = keys.filter(k => /layer/i.test(k));
-    lines.push('CHAVES COM "layer": ' + (layerKeys.join(', ') || '(nenhuma)'));
-    lines.push('');
-    for (const k of layerKeys) {
-      let v;
-      try { v = giraffeState.get(k); } catch (e) { v = '(erro: ' + e.message + ')'; }
-      let s;
-      try { s = JSON.stringify(v, null, 1); } catch { s = String(v); }
-      if (s && s.length > 2500) s = s.slice(0, 2500) + '\n... (truncado)';
-      lines.push('--- ' + k + ' ---');
-      lines.push(s);
-      lines.push('');
-    }
+
     lines.push('LAYERS COM POLÍGONOS (rawSections):');
-    for (const [lid, n] of listLayerIds()) lines.push('  ' + lid + '  (' + n + ')');
+    for (const [lid, n] of listLayerIds()) {
+      const flag = hidden && hidden.has(lid) ? '  [OCULTO → ignorado]' : '';
+      const man  = S.excludedLayers.has(lid) ? '  [excluído manualmente]' : '';
+      lines.push('  ' + lid + '  (' + n + ')' + flag + man);
+    }
+    lines.push('');
+
+    const tree = giraffeState.get('layerTree');
+    lines.push('NÓS GIRDRW DO layerTree:');
+    if (!tree?.items) {
+      lines.push('  (layerTree sem items)');
+    } else {
+      const parentOf = {};
+      for (const [id, node] of Object.entries(tree.items)) {
+        for (const c of (node?.children || [])) parentOf[c] = id;
+      }
+      for (const [id, node] of Object.entries(tree.items)) {
+        if (!GIRDRW_RE.test(id)) continue;
+        lines.push('  ' + id);
+        lines.push('     data = ' + JSON.stringify(node?.data ?? null) + '   pai = ' + (parentOf[id] || '(root)'));
+      }
+      lines.push('');
+      lines.push('GRUPOS:');
+      for (const [id, node] of Object.entries(tree.items)) {
+        if (GIRDRW_RE.test(id) || !node?.children?.length) continue;
+        lines.push('  ' + id + '  data = ' + JSON.stringify(node?.data ?? null));
+      }
+    }
   } catch (e) {
-    lines.push('ERRO: ' + e.message);
+    lines.push('ERRO: ' + e.message + '\n' + e.stack);
   }
   out.textContent = lines.join('\n');
   out.style.display = out.style.display === 'none' ? 'block' : 'none';
 });
 
 giraffeState.addListener(['rawSections'], renderLayerList);
+giraffeState.addListener(['layerTree'], () => { renderLayerList(); scheduleRecompute(); });
 document.getElementById('toggle-perm').addEventListener('click', function () { S.permanent = !S.permanent; this.className = 'toggle' + (S.permanent ? ' on' : ''); scheduleRecompute(); });
 // Sliders + inputs numéricos (bidirecional)
 function wireControl(key, setter, extra) {
