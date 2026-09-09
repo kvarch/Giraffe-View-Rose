@@ -522,6 +522,31 @@ function paletteToGradientCSS(key) {
 // faz edifícios parecerem muito mais altos do que são — era a causa da rosa
 // distorcida quando o observador ficava abaixo da base dos edifícios.
 // Já `height` (propriedade nativa, sem underscore) é altura RELATIVA à base.
+// Cache do floorToFloor por usage (preenchido por loadUsageF2F na inicialização)
+const usageF2F = {};
+const DEFAULT_F2F = 3;  // fallback quando a usage não define floor to floor
+
+// Lê getProjectUsages e monta o mapa usage -> floorToFloor.
+// O Giraffe define floorToFloor no nível do USAGE, não na feature: quando o
+// usuário não edita o valor, a propriedade simplesmente não existe no GeoJSON.
+async function loadUsageF2F() {
+  try {
+    const usages = await rpc.invoke('getProjectUsages', []);
+    let list = usages;
+    if (!Array.isArray(list)) list = list?.usages || Object.values(list || {});
+    for (const u of (list || [])) {
+      const name = u?.usage ?? u?.name ?? u?.id;
+      const f2f  = u?.floorToFloor ?? u?.floor_to_floor ?? u?.properties?.floorToFloor;
+      if (name && Number.isFinite(Number(f2f)) && Number(f2f) > 0) {
+        usageF2F[name] = Number(f2f);
+      }
+    }
+    console.log('[Isovist] floorToFloor por usage:', usageF2F);
+  } catch (e) {
+    console.warn('[Isovist] getProjectUsages indisponível, usando default de', DEFAULT_F2F + 'm:', e);
+  }
+}
+
 function getBuildingTop(f) {
   const p = f.properties || {};
   const base = p._baseHeight ?? p.baseHeight ?? 0;
@@ -536,12 +561,16 @@ function getBuildingTop(f) {
     return base + p.height;
   }
 
-  // 3. Derivado de pavimentos: também RELATIVO à base
-  if (p.levels !== undefined && p.floorToFloor !== undefined) {
-    return base + (p.levels * p.floorToFloor);
-  }
-  if (p._levels !== undefined && p._floorToFloor !== undefined) {
-    return base + (p._levels * p._floorToFloor);
+  // 3. Derivado de pavimentos: RELATIVO à base.
+  //    floorToFloor pode não existir na feature (padrão herdado da usage) —
+  //    nesse caso busca no mapa de usages e, em último caso, usa DEFAULT_F2F.
+  const levels = p.levels ?? p._levels;
+  if (levels !== undefined && levels !== null && Number(levels) > 0) {
+    const f2f = p.floorToFloor
+             ?? p._floorToFloor
+             ?? usageF2F[p.usage]
+             ?? DEFAULT_F2F;
+    return base + (Number(levels) * Number(f2f));
   }
 
   // 4. Sem dado de altura (lotes, linhas, pontos 2D) → não obstrui
@@ -1044,7 +1073,7 @@ document.getElementById('root').innerHTML = `
       <div class="legend-labels"><span>Bloqueado (perto)</span><span>Livre (longe)</span></div>
     </div>
   </div>
-  <footer class="ftr"><p>Beta V37 · © 2026 Königsberger Vannucchi</p></footer>
+  <footer class="ftr"><p>Beta V38 · © 2026 Königsberger Vannucchi</p></footer>
 </div>`;
 
 // ── Wire ─────────────────────────────────────────────────────────────────────
@@ -1126,6 +1155,10 @@ giraffeState.addListener(['mapSelectCoord'], async () => {
 });
 giraffeState.addListener(['rawSections'], renderInfo);
 renderInfo();
+
+// Carrega o floorToFloor definido em cada usage do projeto (usado quando a
+// feature não traz o valor por não ter sido editado pelo usuário)
+loadUsageF2F();
 </script>
 </body>
 </html>
