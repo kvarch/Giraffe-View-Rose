@@ -412,7 +412,8 @@ const S = {
   radius: 300, cone: 360, coneDir: 0,
   useObs: true,
   useOSM: true,
-  onlyVisible: true,   // ignorar elementos em layers ocultos        // incluir edifícios do mapa base (OSM)
+  onlyVisible: true,   // ignorar elementos em layers ocultos
+  excludedLayers: new Set(),  // layers excluídos manualmente pelo usuário        // incluir edifícios do mapa base (OSM)
   permanent: false,     // renderizar em layer permanente (rawSections)
   bands: [
     { label: 'Próximo',  dist: 100, color: '#00ACCD', opacity: 0.55 },
@@ -496,11 +497,11 @@ function getObstacles(excludeId) {
     const tag = f.properties?.sp_tag || '';
     if (tag.startsWith(SP_TAG)) return false;
     if ((f.properties?.layerId || '').startsWith(LO)) return false;
-    // Ignorar elementos em drawing layers ocultos
-    if (hidden && hidden.size) {
-      const lid = f.properties?.layerId;
-      if (lid && hidden.has(lid)) return false;
-    }
+    // Ignorar elementos em drawing layers ocultos (detecção automática)
+    const lid = f.properties?.layerId;
+    if (hidden && hidden.size && lid && hidden.has(lid)) return false;
+    // Ignorar layers excluídos manualmente pelo usuário
+    if (lid && S.excludedLayers.has(lid)) return false;
     if (excludeId && f.properties?.id === excludeId) return false;
     return true;
   });
@@ -1154,7 +1155,19 @@ document.getElementById('root').innerHTML = `
     <div class="divider"><span>Obstruções</span></div>
     <div class="toggle-row"><button class="toggle" id="toggle-obs" aria-label="Ativar raycasting contra edifícios" role="switch" aria-checked="true"></button><span class="toggle-label">Raycasting contra edifícios</span></div>
     <div class="toggle-row"><button class="toggle" id="toggle-osm" aria-label="Incluir edifícios OSM" role="switch" aria-checked="true"></button><span class="toggle-label">Incluir edifícios do mapa base (OSM)</span></div>
-    <div class="toggle-row"><button class="toggle" id="toggle-vis" aria-label="Ignorar elementos em layers ocultos" role="switch" aria-checked="true"></button><span class="toggle-label">Ignorar layers ocultos</span></div>
+    <div class="toggle-row"><button class="toggle" id="toggle-vis" aria-label="Ignorar elementos em layers ocultos" role="switch" aria-checked="true"></button><span class="toggle-label">Ignorar layers ocultos (automático)</span></div>
+
+    <div class="divider">Excluir layers manualmente</div>
+    <div class="info-box" style="padding:8px 10px">
+      <div style="font-size:10px;margin-bottom:6px;color:var(--md-sys-color-outline)">
+        Marque os layers que NÃO devem obstruir a visão.
+      </div>
+      <div id="layer-list" style="display:flex;flex-direction:column;gap:2px;max-height:160px;overflow-y:auto"></div>
+      <button class="btn btn-clear" id="btn-refresh-layers" style="margin-top:8px;min-height:32px;font-size:10px">↻ Atualizar lista</button>
+    </div>
+
+    <button class="btn btn-clear" id="btn-diag" style="min-height:32px;font-size:10px">🔍 Diagnóstico de layers</button>
+    <pre id="diag-out" style="display:none;background:var(--md-sys-color-surface-container-low);border:1px solid var(--md-sys-color-outline-variant);padding:8px;font-size:9px;max-height:200px;overflow:auto;white-space:pre-wrap;word-break:break-all;color:var(--md-sys-color-on-surface-variant);margin:0"></pre>
     <div class="info-box" id="info-obs">—</div>
     <div class="divider"><span>Saída</span></div>
     <div class="toggle-row"><button class="toggle" id="toggle-perm" aria-label="Ativar layer permanente" role="switch" aria-checked="false"></button><span class="toggle-label">Layer permanente (salvo no projeto)</span></div>
@@ -1172,7 +1185,7 @@ document.getElementById('root').innerHTML = `
       <div class="legend-labels"><span>Bloqueado (perto)</span><span>Livre (longe)</span></div>
     </div>
   </div>
-  <footer class="ftr"><p>Beta V39 · © 2026 Königsberger Vannucchi</p></footer>
+  <footer class="ftr"><p>Beta V40 · © 2026 Königsberger Vannucchi</p></footer>
 </div>`;
 
 // ── Wire ─────────────────────────────────────────────────────────────────────
@@ -1186,6 +1199,89 @@ document.getElementById('toggle-obs').className = 'toggle' + (S.useObs ? ' on' :
 document.getElementById('toggle-osm').className = 'toggle' + (S.useOSM ? ' on' : '');
 document.getElementById('toggle-vis').addEventListener('click', function () { S.onlyVisible = !S.onlyVisible; this.className = 'toggle' + (S.onlyVisible ? ' on' : ''); this.setAttribute('aria-checked', S.onlyVisible); scheduleRecompute(); });
 document.getElementById('toggle-vis').className = 'toggle' + (S.onlyVisible ? ' on' : '');
+
+// ─── Lista de layers com checkbox de exclusão ────────────────────────────────
+function listLayerIds() {
+  let raw = giraffeState.get('rawSections');
+  if (!raw) return [];
+  if (!Array.isArray(raw)) raw = raw.features || Object.values(raw) || [];
+  const counts = {};
+  for (const f of raw) {
+    const lid = f?.properties?.layerId;
+    if (!lid) continue;
+    const geom = f.geometry?.type;
+    if (geom !== 'Polygon' && geom !== 'MultiPolygon') continue;
+    counts[lid] = (counts[lid] || 0) + 1;
+  }
+  return Object.entries(counts).sort((a, b) => b[1] - a[1]);
+}
+
+function renderLayerList() {
+  const box = document.getElementById('layer-list');
+  const layers = listLayerIds();
+  if (!layers.length) {
+    box.innerHTML = '<div style="font-size:10px;color:var(--md-sys-color-outline)">Nenhum layer com polígonos encontrado.</div>';
+    return;
+  }
+  box.innerHTML = '';
+  for (const [lid, n] of layers) {
+    const row = document.createElement('label');
+    row.style.cssText = 'display:flex;align-items:center;gap:6px;font-size:10.5px;cursor:pointer;min-height:26px;color:var(--md-sys-color-on-surface-variant)';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = S.excludedLayers.has(lid);
+    cb.style.cssText = 'width:14px;height:14px;accent-color:var(--kv-accent);cursor:pointer;flex-shrink:0';
+    cb.addEventListener('change', () => {
+      if (cb.checked) S.excludedLayers.add(lid); else S.excludedLayers.delete(lid);
+      scheduleRecompute();
+    });
+    const txt = document.createElement('span');
+    txt.textContent = lid;
+    txt.style.cssText = 'flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+    txt.title = lid;
+    const cnt = document.createElement('span');
+    cnt.textContent = n;
+    cnt.style.cssText = 'font-size:9px;color:var(--md-sys-color-outline);font-variant-numeric:tabular-nums';
+    row.append(cb, txt, cnt);
+    box.appendChild(row);
+  }
+}
+
+document.getElementById('btn-refresh-layers').addEventListener('click', renderLayerList);
+renderLayerList();
+
+// ─── Diagnóstico: mostra o estado dos layers direto no painel ────────────────
+document.getElementById('btn-diag').addEventListener('click', () => {
+  const out = document.getElementById('diag-out');
+  const lines = [];
+  try {
+    const keys = Object.keys(giraffeState.attr || {});
+    lines.push('CHAVES DO giraffeState:');
+    lines.push(keys.join(', ') || '(nenhuma)');
+    lines.push('');
+    const layerKeys = keys.filter(k => /layer/i.test(k));
+    lines.push('CHAVES COM "layer": ' + (layerKeys.join(', ') || '(nenhuma)'));
+    lines.push('');
+    for (const k of layerKeys) {
+      let v;
+      try { v = giraffeState.get(k); } catch (e) { v = '(erro: ' + e.message + ')'; }
+      let s;
+      try { s = JSON.stringify(v, null, 1); } catch { s = String(v); }
+      if (s && s.length > 2500) s = s.slice(0, 2500) + '\n... (truncado)';
+      lines.push('--- ' + k + ' ---');
+      lines.push(s);
+      lines.push('');
+    }
+    lines.push('LAYERS COM POLÍGONOS (rawSections):');
+    for (const [lid, n] of listLayerIds()) lines.push('  ' + lid + '  (' + n + ')');
+  } catch (e) {
+    lines.push('ERRO: ' + e.message);
+  }
+  out.textContent = lines.join('\n');
+  out.style.display = out.style.display === 'none' ? 'block' : 'none';
+});
+
+giraffeState.addListener(['rawSections'], renderLayerList);
 document.getElementById('toggle-perm').addEventListener('click', function () { S.permanent = !S.permanent; this.className = 'toggle' + (S.permanent ? ' on' : ''); scheduleRecompute(); });
 // Sliders + inputs numéricos (bidirecional)
 function wireControl(key, setter, extra) {
