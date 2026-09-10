@@ -413,7 +413,10 @@ const S = {
   useObs: true,
   useOSM: true,
   onlyVisible: true,   // ignorar elementos em layers ocultos
-  excludedLayers: new Set(),  // layers excluídos manualmente pelo usuário        // incluir edifícios do mapa base (OSM)
+  excludedLayers: new Set(),  // layers excluídos manualmente pelo usuário
+  autoSync: true,      // recalcular ao mover o elemento observador ou o entorno
+  observerIsPoint: false,  // true = ponto (herda Z sempre) | false = edifício
+  manualHeight: false,     // usuário editou a altura à mão → respeitar em edifícios        // incluir edifícios do mapa base (OSM)
   permanent: false,     // renderizar em layer permanente (rawSections)
   bands: [
     { label: 'Próximo',  dist: 100, color: '#00ACCD', opacity: 0.55 },
@@ -907,6 +910,9 @@ async function compute() {
 // (SP_TAG declarado no topo, junto das constantes globais)
 
 function obsTag(obs) {
+  // Quando o observador é um elemento do projeto, a tag usa o ID dele: assim,
+  // se o elemento for movido, a rosa antiga é substituída em vez de virar órfã.
+  if (S.observerFeatId) return `${SP_TAG}_el_${S.observerFeatId}`;
   return `${SP_TAG}_${obs[0].toFixed(5)}_${obs[1].toFixed(5)}`;
 }
 
@@ -998,7 +1004,14 @@ function renderObs() {
   if (S.observer) {
     c.className = 'obs-card visible';
     document.getElementById('obs-val').textContent = `${S.observer[1].toFixed(5)}, ${S.observer[0].toFixed(5)}`;
-    document.getElementById('obs-lbl-txt').textContent = S.observerLabel + (S.observerHeight > 0 ? ` · ${S.observerHeight.toFixed(1)}m` : '');
+    // Indica quando a altura está travada em valor manual (só edifícios)
+    const trava = (!S.observerIsPoint && S.manualHeight) ? ' 🔒' : '';
+    document.getElementById('obs-lbl-txt').textContent =
+      S.observerLabel + (S.observerHeight > 0 ? ` · ${S.observerHeight.toFixed(1)}m` : '') + trava;
+    const cd = document.getElementById('obs-card');
+    if (cd) cd.title = trava
+      ? 'Altura definida manualmente — não será sobrescrita ao mover o edifício. Selecione outro elemento para voltar a herdar.'
+      : '';
   } else c.className = 'obs-card';
 }
 function renderBtns() {
@@ -1062,6 +1075,170 @@ function inheritPointHeight(coord) {
 }
 
 // ─── Ações ────────────────────────────────────────────────────────────────────
+/* ─── Sincronização automática ────────────────────────────────────────────────
+   giraffeState.addListener não dispara de forma confiável no contexto iframe,
+   então usa-se polling curto com assinaturas (mesmo padrão do KV Sombras):
+     • trackSignature — id + centróide + cota do elemento observador
+     • envSignature   — hash do entorno (posição + altura dos obstáculos)
+   Qualquer mudança agenda um recompute com debounce.                          */
+let lastTrackSig = '';
+let lastEnvSig   = 0;
+let syncTimer    = null;
+
+function hashNum(h, v) { return Math.imul(h ^ (v | 0), 16777619) >>> 0; }
+
+function trackSignature(f) {
+  if (!f) return '';
+  try {
+    const c = turf.centroid(f).geometry.coordinates;
+    const p = f.properties || {};
+    const z = p._baseHeight ?? p.baseHeight ?? 0;
+    const h = p._height ?? p.height ?? p.levels ?? 0;
+    const id = p.id || f.id || '?';
+    return `${id}@${c[0].toFixed(7)},${c[1].toFixed(7)}#${z}|${h}`;
+  } catch { return ''; }
+}
+
+// Hash do entorno: detecta edifícios movidos, criados, apagados ou alterados
+function envSignature() {
+  try {
+    let raw = giraffeState.get('rawSections');
+    if (!raw) return 0;
+    if (!Array.isArray(raw)) raw = raw.features || Object.values(raw) || [];
+    // IMPORTANTE: o hash é semeado com a contagem JÁ FILTRADA. Semear com
+    // raw.length incluiria as rosas criadas pelo próprio app e o número de
+    // seções mudaria a cada recompute, realimentando o ciclo indefinidamente.
+    let n = 0;
+    let h = 2166136261 >>> 0;
+    for (const f of raw) {
+      const g = f?.geometry;
+      if (!g?.coordinates) continue;
+      // Ignora as próprias rosas para não realimentar o loop
+      if ((f.properties?.sp_tag || '').startsWith(SP_TAG)) continue;
+      let c = g.coordinates;
+      while (Array.isArray(c[0])) c = c[0];
+      const p = f.properties || {};
+      const ht = Number(p._height ?? p.height ?? p.levels ?? 0) || 0;
+      const bh = Number(p._baseHeight ?? p.baseHeight ?? 0) || 0;
+      h = hashNum(h, c[0] * 1e5);
+      h = hashNum(h, c[1] * 1e5);
+      h = hashNum(h, ht * 10);
+      h = hashNum(h, bh * 10);
+      n++;
+    }
+    return hashNum(h, n) || 1;   // nunca 0 (0 = "indisponível")
+  } catch { return 0; }
+}
+
+function setSyncStatus(txt) {
+  const el = document.getElementById('sync-status');
+  if (el) el.textContent = txt;
+}
+
+function scheduleSync(motivo) {
+  if (!S.autoSync || !S.observer) return;
+  setSyncStatus('Alteração detectada (' + motivo + ') — recalculando…');
+  clearTimeout(syncTimer);
+  syncTimer = setTimeout(async () => {
+    await runCompute();
+    setSyncStatus('Sincronizado · ' + new Date().toLocaleTimeString('pt-BR'));
+  }, 600);
+}
+
+setInterval(async () => {
+  if (!S.autoSync) return;
+  if (S.status === 'compute' || S.status === 'waiting') return;
+  try {
+    const r = await rpc.invoke('getSelectedFeatures', []);
+    const feats = Array.isArray(r) ? r : (r?.features || []);
+
+    if (feats.length) {
+      const f = feats[0];
+      const sig = trackSignature(f);
+      if (sig && sig !== lastTrackSig) {
+        const novoId = f.properties?.id || f.id || null;
+        const trocouElemento = novoId !== S.observerFeatId;
+        lastTrackSig = sig;
+        const o = readObserverFromFeature(f);
+
+        // Nova seleção reinicia o contexto: herda tudo do elemento
+        if (trocouElemento) { S.manualHeight = false; S.observerIsPoint = o.isPoint; }
+
+        S.observer       = o.coord;
+        S.observerFeatId = o.id;
+        S.observerLabel  = o.label;
+
+        // ── Altura: comportamento distinto por tipo de observador ──────────
+        // PONTO: o usuário o move em X, Y e Z no próprio Giraffe, então o Z
+        //        do elemento é sempre a fonte da verdade.
+        // EDIFÍCIO: segue X e Y, mas se o usuário ajustou a altura à mão no
+        //        painel (para simular um pavimento específico), esse valor é
+        //        preservado — só volta a herdar ao selecionar outro elemento.
+        const herdarAltura = o.isPoint || !S.manualHeight;
+        if (herdarAltura) {
+          S.observerHeight = o.height;
+          syncControl('h', Math.round(S.observerHeight));
+        }
+
+        renderObs(); renderBtns();
+        let motivo;
+        if (trocouElemento) motivo = 'nova seleção';
+        else if (!herdarAltura) motivo = 'elemento movido (altura manual mantida)';
+        else motivo = 'elemento movido';
+        scheduleSync(motivo);
+      }
+    }
+
+    // Entorno alterado (obstáculos movidos/criados/removidos)
+    const env = envSignature();
+    if (env && env !== lastEnvSig) {
+      const primeira = lastEnvSig === 0;
+      lastEnvSig = env;
+      if (!primeira && S.observer) scheduleSync('entorno alterado');
+    }
+  } catch { /* silencioso — seleção pode estar indisponível momentaneamente */ }
+}, 500);
+
+// Lê posição + altura de uma feature (reutilizado por fromSel e pelo auto-sync)
+function readObserverFromFeature(f) {
+  const c = turf.centroid(f).geometry.coordinates;
+  let props = f.properties || {};
+  // Se getSelectedFeatures veio sem as props de altura, busca a feição
+  // completa no rawSections pelo id (ou por coordenadas, para pontos)
+  if (props._baseHeight === undefined) {
+    let raw = giraffeState.get('rawSections') || [];
+    if (!Array.isArray(raw)) raw = raw.features || Object.values(raw) || [];
+    let full = props.id ? raw.find(rf => rf?.properties?.id === props.id) : null;
+    if (!full && f.geometry?.type === 'Point') {
+      const [fx, fy] = f.geometry.coordinates;
+      full = raw.find(rf => {
+        if (rf?.geometry?.type !== 'Point') return false;
+        const [rx, ry] = rf.geometry.coordinates;
+        return Math.abs(rx - fx) < 1e-7 && Math.abs(ry - fy) < 1e-7;
+      });
+    }
+    if (full?.properties) props = { ...full.properties, ...props };
+  }
+  const bh = Number(props._baseHeight ?? props.baseHeight) || 0;
+  let ht = Number(props._height ?? props.height) || 0;
+  if (!ht && props.levels !== undefined) {
+    const f2f = props.floorToFloor ?? props._floorToFloor ?? usageF2F[props.usage] ?? DEFAULT_F2F;
+    ht = (Number(props.levels) || 0) * (Number(f2f) || 0);
+  }
+  const coordZ = Number(f.geometry?.coordinates?.[2]) || 0;
+  const isPoint = f.geometry?.type === 'Point';
+  // PONTO: usa o _baseHeight direto (onde o ponto está posicionado no 3D).
+  // POLÍGONO: usa o topo (base + altura do edifício).
+  const height = isPoint ? (bh || coordZ) : (bh + ht) || coordZ;
+  return {
+    coord: c,
+    height,
+    isPoint,
+    id: props.id || f.properties?.id || null,
+    label: isPoint ? 'Ponto selecionado' : 'Edifício selecionado',
+  };
+}
+
 async function fromSel() {
   if (S.status === 'compute') return;
   setStatus('compute', 'Lendo seleção...'); renderBtns();
@@ -1069,42 +1246,14 @@ async function fromSel() {
     const r = await rpc.invoke('getSelectedFeatures', []);
     const feats = Array.isArray(r) ? r : (r?.features || []);
     if (!feats.length) { setStatus('error', 'Nenhum elemento selecionado no mapa.'); renderBtns(); return; }
-    const f = feats[0];
-    const c = turf.centroid(f).geometry.coordinates;
-    S.observer = c;
-    S.observerLabel = 'Edifício selecionado';
-    S.observerFeatId = f.properties?.id || null;
-    // Ler altura do elemento selecionado (robusto para pontos e polígonos)
-    let props = f.properties || {};
-    // Se getSelectedFeatures veio sem as props de altura, busca a feição
-    // completa no rawSections pelo id
-    if (props._baseHeight === undefined) {
-      let raw = giraffeState.get('rawSections') || [];
-      if (!Array.isArray(raw)) raw = raw.features || Object.values(raw) || [];
-      // Tenta por id primeiro; depois por coordenadas (pontos)
-      let full = props.id ? raw.find(rf => rf?.properties?.id === props.id) : null;
-      if (!full && f.geometry?.type === 'Point') {
-        const [fx, fy] = f.geometry.coordinates;
-        full = raw.find(rf => {
-          if (rf?.geometry?.type !== 'Point') return false;
-          const [rx, ry] = rf.geometry.coordinates;
-          return Math.abs(rx - fx) < 1e-7 && Math.abs(ry - fy) < 1e-7;
-        });
-      }
-      if (full?.properties) props = { ...full.properties, ...props };
-    }
-    const bh = Number(props._baseHeight ?? props.baseHeight) || 0;
-    let ht = Number(props._height ?? props.height) || 0;
-    if (!ht && props.levels !== undefined && props.floorToFloor !== undefined) {
-      ht = (Number(props.levels) || 0) * (Number(props.floorToFloor) || 0);
-    }
-    const coordZ = Number(f.geometry?.coordinates?.[2]) || 0;
-    const isPoint = f.geometry?.type === 'Point';
-    // PONTO: usa o _baseHeight direto (onde o ponto está posicionado no 3D).
-    // POLÍGONO: usa o topo (base + altura do edifício).
-    S.observerHeight = isPoint ? (bh || coordZ) : (bh + ht) || coordZ;
-    S.observerLabel = isPoint ? 'Ponto selecionado' : 'Edifício selecionado';
-    console.log('[Isovist] Altura:', JSON.stringify({ isPoint, _baseHeight: bh, _height: ht, coordZ, result: S.observerHeight }));
+    const o = readObserverFromFeature(feats[0]);
+    S.observer = o.coord;
+    S.observerFeatId = o.id;
+    S.observerHeight = o.height;
+    S.observerLabel = o.label;
+    S.observerIsPoint = o.isPoint;
+    S.manualHeight = false;     // nova seleção → recomeça herdando do elemento
+    lastTrackSig = trackSignature(feats[0]);
     syncControl('h', Math.round(S.observerHeight));
     renderObs(); await runCompute();
   } catch (e) { setStatus('error', String(e)); renderBtns(); }
@@ -1122,6 +1271,8 @@ async function fromMap() {
       isListening = false;
       S.observer = Array.isArray(pt) ? pt : [pt.lng ?? pt[0], pt.lat ?? pt[1]];
       S.observerLabel = 'Ponto no mapa';
+      S.observerIsPoint = true;
+      S.manualHeight = false;
       // Herdar altura de ponto existente próximo ao clique
       const inherited = inheritPointHeight(S.observer);
       if (inherited !== null) { S.observerHeight = inherited; syncControl('h', Math.round(inherited)); }
@@ -1163,6 +1314,8 @@ document.getElementById('root').innerHTML = `
     <div class="toggle-row"><button class="toggle" id="toggle-obs" aria-label="Ativar raycasting contra edifícios" role="switch" aria-checked="true"></button><span class="toggle-label">Raycasting contra edifícios</span></div>
     <div class="toggle-row"><button class="toggle" id="toggle-osm" aria-label="Incluir edifícios OSM" role="switch" aria-checked="true"></button><span class="toggle-label">Incluir edifícios do mapa base (OSM)</span></div>
     <div class="toggle-row"><button class="toggle" id="toggle-vis" aria-label="Ignorar elementos em layers ocultos" role="switch" aria-checked="true"></button><span class="toggle-label">Ignorar layers ocultos (automático)</span></div>
+    <div class="toggle-row"><button class="toggle" id="toggle-sync" aria-label="Sincronização automática" role="switch" aria-checked="true"></button><span class="toggle-label">Sincronização automática</span></div>
+    <div id="sync-status" style="font-size:9.5px;color:var(--md-sys-color-outline);padding:0 0 2px 46px;min-height:13px" aria-live="polite"></div>
 
     <div class="divider">Excluir layers manualmente</div>
     <div class="info-box" style="padding:8px 10px">
@@ -1192,7 +1345,7 @@ document.getElementById('root').innerHTML = `
       <div class="legend-labels"><span>Bloqueado (perto)</span><span>Livre (longe)</span></div>
     </div>
   </div>
-  <footer class="ftr"><p>Beta V41 · © 2026 Königsberger Vannucchi</p></footer>
+  <footer class="ftr"><p>Beta V43 · © 2026 Königsberger Vannucchi</p></footer>
 </div>`;
 
 // ── Wire ─────────────────────────────────────────────────────────────────────
@@ -1206,6 +1359,15 @@ document.getElementById('toggle-obs').className = 'toggle' + (S.useObs ? ' on' :
 document.getElementById('toggle-osm').className = 'toggle' + (S.useOSM ? ' on' : '');
 document.getElementById('toggle-vis').addEventListener('click', function () { S.onlyVisible = !S.onlyVisible; this.className = 'toggle' + (S.onlyVisible ? ' on' : ''); this.setAttribute('aria-checked', S.onlyVisible); renderLayerList(); scheduleRecompute(); });
 document.getElementById('toggle-vis').className = 'toggle' + (S.onlyVisible ? ' on' : '');
+document.getElementById('toggle-sync').addEventListener('click', function () {
+  S.autoSync = !S.autoSync;
+  this.className = 'toggle' + (S.autoSync ? ' on' : '');
+  this.setAttribute('aria-checked', S.autoSync);
+  if (!S.autoSync) { clearTimeout(syncTimer); setSyncStatus('Sincronização desligada.'); }
+  else setSyncStatus('Aguardando alterações…');
+});
+document.getElementById('toggle-sync').className = 'toggle' + (S.autoSync ? ' on' : '');
+setSyncStatus(S.autoSync ? 'Aguardando alterações…' : 'Sincronização desligada.');
 
 // ─── Lista de layers com checkbox de exclusão ────────────────────────────────
 function listLayerIds() {
@@ -1333,7 +1495,7 @@ function wireControl(key, setter, extra) {
     if (extra) extra(v); scheduleRecompute();
   });
 }
-wireControl('h', v => S.observerHeight = v);
+wireControl('h', v => { S.observerHeight = v; S.manualHeight = true; renderObs(); });
 wireControl('r', v => S.radius = v);
 wireControl('c', v => { S.cone = v; }, v => {
   document.getElementById('grp-dir').style.display = v >= 359.9 ? 'none' : '';
