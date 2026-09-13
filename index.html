@@ -1135,8 +1135,29 @@ function setSyncStatus(txt) {
   if (el) el.textContent = txt;
 }
 
+// Disjuntor: se a sincronização disparar em cascata (loop de realimentação),
+// desliga sozinha em vez de travar o app renderizando indefinidamente.
+const SYNC_BURST_MAX = 8;       // recálculos...
+const SYNC_BURST_WINDOW = 6000; // ...dentro desta janela (ms) = loop
+let syncTimes = [];
+
 function scheduleSync(motivo) {
   if (!S.autoSync || !S.observer) return;
+
+  const agora = Date.now();
+  syncTimes = syncTimes.filter(t => agora - t < SYNC_BURST_WINDOW);
+  if (syncTimes.length >= SYNC_BURST_MAX) {
+    S.autoSync = false;
+    const btn = document.getElementById('toggle-sync');
+    if (btn) { btn.className = 'toggle'; btn.setAttribute('aria-checked', 'false'); }
+    clearTimeout(syncTimer);
+    syncTimes = [];
+    setSyncStatus('Sincronização desligada: recálculos em cascata detectados.');
+    console.warn('[Isovist] disjuntor acionado — último motivo:', motivo);
+    return;
+  }
+  syncTimes.push(agora);
+
   setSyncStatus('Alteração detectada (' + motivo + ') — recalculando…');
   clearTimeout(syncTimer);
   syncTimer = setTimeout(async () => {
@@ -1152,8 +1173,13 @@ setInterval(async () => {
     const r = await rpc.invoke('getSelectedFeatures', []);
     const feats = Array.isArray(r) ? r : (r?.features || []);
 
-    if (feats.length) {
-      const f = feats[0];
+    // Ignorar seleção das PRÓPRIAS rosas: no modo permanente as seções recém
+    // criadas podem ficar selecionadas, e adotá-las como observador realimenta
+    // o ciclo (rosa gera rosa).
+    const validas = feats.filter(f => !(f?.properties?.sp_tag || '').startsWith(SP_TAG));
+
+    if (validas.length) {
+      const f = validas[0];
       const sig = trackSignature(f);
       if (sig && sig !== lastTrackSig) {
         const novoId = f.properties?.id || f.id || null;
@@ -1345,7 +1371,7 @@ document.getElementById('root').innerHTML = `
       <div class="legend-labels"><span>Bloqueado (perto)</span><span>Livre (longe)</span></div>
     </div>
   </div>
-  <footer class="ftr"><p>Beta V43 · © 2026 Königsberger Vannucchi</p></footer>
+  <footer class="ftr"><p>Beta V44 · © 2026 Königsberger Vannucchi</p></footer>
 </div>`;
 
 // ── Wire ─────────────────────────────────────────────────────────────────────
@@ -1477,7 +1503,29 @@ document.getElementById('btn-diag').addEventListener('click', () => {
 });
 
 giraffeState.addListener(['rawSections'], renderLayerList);
-giraffeState.addListener(['layerTree'], () => { renderLayerList(); scheduleRecompute(); });
+// O layerTree muda a CADA render em modo temporário, porque renderLayer faz
+// removeTempLayer + addTempLayerGeoJSON e o nó GIRTMP-isov_rose entra e sai da
+// árvore. Recalcular direto no listener criava um loop infinito (a rosa piscava).
+// Só recalculamos quando o CONJUNTO DE LAYERS OCULTOS realmente muda.
+let lastHiddenSig = null;
+function hiddenSignature() {
+  const h = getHiddenLayerNames();
+  if (h === null) return 'null';
+  return [...h].sort().join('|');
+}
+lastHiddenSig = hiddenSignature();
+
+let layerTreeTimer = null;
+giraffeState.addListener(['layerTree'], () => {
+  clearTimeout(layerTreeTimer);
+  layerTreeTimer = setTimeout(() => {
+    const sig = hiddenSignature();
+    if (sig === lastHiddenSig) { renderLayerList(); return; }  // só ruído de temp layer
+    lastHiddenSig = sig;
+    renderLayerList();
+    if (S.observer) scheduleSync('visibilidade de layer alterada');
+  }, 250);
+});
 document.getElementById('toggle-perm').addEventListener('click', function () { S.permanent = !S.permanent; this.className = 'toggle' + (S.permanent ? ' on' : ''); scheduleRecompute(); });
 // Sliders + inputs numéricos (bidirecional)
 function wireControl(key, setter, extra) {
