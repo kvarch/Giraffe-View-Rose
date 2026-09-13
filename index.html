@@ -1166,63 +1166,55 @@ function scheduleSync(motivo) {
   }, 600);
 }
 
-setInterval(async () => {
+/* O rastreamento NÃO usa getSelectedFeatures: olhar a seleção faria o app
+   adotar qualquer elemento clicado como novo observador, disparando análises
+   que o usuário não pediu. Em vez disso, procuramos no rawSections o elemento
+   que JÁ foi escolhido como observador (S.observerFeatId), definido apenas
+   pelos botões ⊙ / ◎. Trocar de observador exige clicar no botão de novo.   */
+function findObserverFeature() {
+  if (!S.observerFeatId) return null;
+  try {
+    let raw = giraffeState.get('rawSections');
+    if (!raw) return null;
+    if (!Array.isArray(raw)) raw = raw.features || Object.values(raw) || [];
+    return raw.find(f => (f?.properties?.id || f?.id) === S.observerFeatId) || null;
+  } catch { return null; }
+}
+
+setInterval(() => {
   if (!S.autoSync) return;
+  if (!S.observer) return;                                   // nada analisado ainda
   if (S.status === 'compute' || S.status === 'waiting') return;
   try {
-    const r = await rpc.invoke('getSelectedFeatures', []);
-    const feats = Array.isArray(r) ? r : (r?.features || []);
-
-    // Ignorar seleção das PRÓPRIAS rosas: no modo permanente as seções recém
-    // criadas podem ficar selecionadas, e adotá-las como observador realimenta
-    // o ciclo (rosa gera rosa).
-    const validas = feats.filter(f => !(f?.properties?.sp_tag || '').startsWith(SP_TAG));
-
-    if (validas.length) {
-      const f = validas[0];
+    // ── 1. O elemento observador se moveu? ────────────────────────────────
+    const f = findObserverFeature();
+    if (f) {
       const sig = trackSignature(f);
       if (sig && sig !== lastTrackSig) {
-        const novoId = f.properties?.id || f.id || null;
-        const trocouElemento = novoId !== S.observerFeatId;
         lastTrackSig = sig;
         const o = readObserverFromFeature(f);
+        S.observer = o.coord;
 
-        // Nova seleção reinicia o contexto: herda tudo do elemento
-        if (trocouElemento) { S.manualHeight = false; S.observerIsPoint = o.isPoint; }
-
-        S.observer       = o.coord;
-        S.observerFeatId = o.id;
-        S.observerLabel  = o.label;
-
-        // ── Altura: comportamento distinto por tipo de observador ──────────
-        // PONTO: o usuário o move em X, Y e Z no próprio Giraffe, então o Z
-        //        do elemento é sempre a fonte da verdade.
-        // EDIFÍCIO: segue X e Y, mas se o usuário ajustou a altura à mão no
-        //        painel (para simular um pavimento específico), esse valor é
-        //        preservado — só volta a herdar ao selecionar outro elemento.
-        const herdarAltura = o.isPoint || !S.manualHeight;
+        // PONTO: herda o Z sempre (o usuário o move nos 3 eixos no Giraffe).
+        // EDIFÍCIO: segue X e Y; a altura manual do painel é preservada.
+        const herdarAltura = S.observerIsPoint || !S.manualHeight;
         if (herdarAltura) {
           S.observerHeight = o.height;
           syncControl('h', Math.round(S.observerHeight));
         }
-
-        renderObs(); renderBtns();
-        let motivo;
-        if (trocouElemento) motivo = 'nova seleção';
-        else if (!herdarAltura) motivo = 'elemento movido (altura manual mantida)';
-        else motivo = 'elemento movido';
-        scheduleSync(motivo);
+        renderObs();
+        scheduleSync(herdarAltura ? 'observador movido' : 'observador movido (altura manual mantida)');
       }
     }
 
-    // Entorno alterado (obstáculos movidos/criados/removidos)
+    // ── 2. O entorno mudou? ───────────────────────────────────────────────
     const env = envSignature();
     if (env && env !== lastEnvSig) {
       const primeira = lastEnvSig === 0;
       lastEnvSig = env;
-      if (!primeira && S.observer) scheduleSync('entorno alterado');
+      if (!primeira) scheduleSync('entorno alterado');
     }
-  } catch { /* silencioso — seleção pode estar indisponível momentaneamente */ }
+  } catch { /* silencioso */ }
 }, 500);
 
 // Lê posição + altura de uma feature (reutilizado por fromSel e pelo auto-sync)
@@ -1279,7 +1271,10 @@ async function fromSel() {
     S.observerLabel = o.label;
     S.observerIsPoint = o.isPoint;
     S.manualHeight = false;     // nova seleção → recomeça herdando do elemento
-    lastTrackSig = trackSignature(feats[0]);
+    // A assinatura precisa vir da MESMA fonte que o polling usa (rawSections),
+    // senão a diferença entre feature avaliada e crua dispara um falso
+    // "observador movido" logo após a primeira análise.
+    lastTrackSig = trackSignature(findObserverFeature()) || trackSignature(feats[0]);
     syncControl('h', Math.round(S.observerHeight));
     renderObs(); await runCompute();
   } catch (e) { setStatus('error', String(e)); renderBtns(); }
@@ -1371,7 +1366,7 @@ document.getElementById('root').innerHTML = `
       <div class="legend-labels"><span>Bloqueado (perto)</span><span>Livre (longe)</span></div>
     </div>
   </div>
-  <footer class="ftr"><p>Beta V44 · © 2026 Königsberger Vannucchi</p></footer>
+  <footer class="ftr"><p>Beta V45 · © 2026 Königsberger Vannucchi</p></footer>
 </div>`;
 
 // ── Wire ─────────────────────────────────────────────────────────────────────
