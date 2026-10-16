@@ -427,7 +427,7 @@ const S = {
   status: 'idle', computeMs: null, obstCount: 0,
 };
 // Cache de edifícios OSM (evita re-fetch a cada mudança de slider)
-const osmCache = { center: null, radius: 0, features: [] };
+const osmCache = { center: null, radius: 0, covered: 0, features: [], forceRefresh: false };
 let isListening = false, debounce = null;
 
 // ─── Obter obstáculos ─────────────────────────────────────────────────────────
@@ -788,50 +788,165 @@ async function renderLayer(name, fc, style) {
 // Os edifícios do mapa base do Giraffe são tiles vetoriais do Mapbox (OSM) e não
 // são acessíveis como geometria pelo SDK. Buscamos os mesmos dados na fonte:
 // a API Overpass do OpenStreetMap, com cache por posição+raio.
-async function fetchOSMBuildings(obs, radiusM) {
-  // Cache: reutiliza se o observador moveu <100m e o raio não aumentou
-  if (osmCache.center && osmCache.radius >= radiusM) {
-    const moved = turf.distance(turf.point(osmCache.center), turf.point(obs), { units: 'meters' });
-    if (moved < 100) return osmCache.features;
+/* ─── Edifícios OSM (Overpass) com cache robusto ─────────────────────────────
+   Antes: cache só valia se o observador andasse <100m e o raio não subisse, e
+   não havia controle de requisição em andamento — editar parâmetros durante a
+   primeira busca disparava novas buscas completas.
+   Agora:
+     • a busca cobre uma ÁREA com folga (covered), reaproveitada enquanto o
+       círculo de análise couber nela;
+     • requisição em andamento é compartilhada (sem buscas duplicadas);
+     • a área baixada fica gravada no navegador (abrir o painel de novo é rápido);
+     • espelhos do Overpass como alternativa se o principal estiver lento;
+     • só os edifícios dentro de raio×1,2 seguem para o raycasting, exatamente
+       como antes — o custo do cálculo não muda.                             */
+const OSM_ENDPOINTS = [
+  'https://overpass-api.de/api/interpreter',
+  'https://overpass.kumi.systems/api/interpreter',
+  'https://overpass.private.coffee/api/interpreter',
+];
+const OSM_STORE_KEY = 'kv_isovist_osm_v1';
+const OSM_STORE_TTL = 7 * 24 * 3600 * 1000;   // 7 dias
+let osmInflight = null;                         // { center, covered, promise }
+
+function osmCovers(center, covered, obs, radiusM) {
+  if (!center || !covered) return false;
+  const d = turf.distance(turf.point(center), turf.point(obs), { units: 'meters' });
+  return d + radiusM * 1.2 <= covered;
+}
+
+// Mantém só os edifícios cujo bbox toca o círculo de raio×1,2 (mesma área
+// que a busca antiga trazia), para o raycasting ter a mesma carga de antes.
+function osmNear(feats, obs, radiusM) {
+  const R = radiusM * 1.2;
+  const dLat = R / 111320;
+  const dLng = R / (111320 * Math.cos(obs[1] * Math.PI / 180));
+  const x0 = obs[0] - dLng, x1 = obs[0] + dLng, y0 = obs[1] - dLat, y1 = obs[1] + dLat;
+  return feats.filter(f => {
+    const b = f.bbox;
+    if (!b) return true;
+    return !(b[2] < x0 || b[0] > x1 || b[3] < y0 || b[1] > y1);
+  });
+}
+
+function parseOverpass(data) {
+  const feats = [];
+  for (const el of (data.elements || [])) {
+    if (el.type !== 'way' || !el.geometry || el.geometry.length < 4) continue;
+    const ring = el.geometry.map(g => [g.lon, g.lat]);
+    // Garantir anel fechado
+    if (ring[0][0] !== ring[ring.length-1][0] || ring[0][1] !== ring[ring.length-1][1]) ring.push(ring[0]);
+    // Altura: tag height (m) > building:levels × 3m > 10m default
+    const tags = el.tags || {};
+    let h = parseFloat(tags.height) || 0;
+    if (!h && tags['building:levels']) h = (parseFloat(tags['building:levels']) || 0) * 3;
+    if (!h) h = 10; // edifício OSM sem altura: assume 10m (~3 pavimentos)
+    try {
+      const f = turf.polygon([ring], { _baseHeight: 0, _height: h, source: 'osm' });
+      f.bbox = turf.bbox(f);
+      feats.push(f);
+    } catch {}
   }
+  return feats;
+}
 
-  setStatus('compute', 'Buscando edifícios do mapa (OSM)...');
-  const query = `[out:json][timeout:25];(way["building"](around:${Math.round(radiusM * 1.2)},${obs[1]},${obs[0]}););out geom;`;
-
+function saveOSMStore(center, covered, feats) {
   try {
-    const res = await fetch('https://overpass-api.de/api/interpreter', {
-      method: 'POST',
-      body: 'data=' + encodeURIComponent(query),
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    });
-    if (!res.ok) throw new Error('Overpass HTTP ' + res.status);
-    const data = await res.json();
+    // Formato compacto: [anel com 6 casas decimais, altura]
+    const compact = feats.map(f => [
+      f.geometry.coordinates[0].map(([x, y]) => [+x.toFixed(6), +y.toFixed(6)]),
+      f.properties._height,
+    ]);
+    const s = JSON.stringify({ t: Date.now(), center, covered, f: compact });
+    if (s.length > 3_500_000) return;           // não estoura o limite do navegador
+    localStorage.setItem(OSM_STORE_KEY, s);
+  } catch {}
+}
 
+function loadOSMStore() {
+  try {
+    const d = JSON.parse(localStorage.getItem(OSM_STORE_KEY) || 'null');
+    if (!d || !Array.isArray(d.f) || Date.now() - d.t > OSM_STORE_TTL) return null;
     const feats = [];
-    for (const el of (data.elements || [])) {
-      if (el.type !== 'way' || !el.geometry || el.geometry.length < 4) continue;
-      const ring = el.geometry.map(g => [g.lon, g.lat]);
-      // Garantir anel fechado
-      if (ring[0][0] !== ring[ring.length-1][0] || ring[0][1] !== ring[ring.length-1][1]) ring.push(ring[0]);
-      // Altura: tag height (m) > building:levels × 3m > 10m default
-      const tags = el.tags || {};
-      let h = parseFloat(tags.height) || 0;
-      if (!h && tags['building:levels']) h = (parseFloat(tags['building:levels']) || 0) * 3;
-      if (!h) h = 10; // edifício OSM sem altura: assume 10m (~3 pavimentos)
+    for (const [ring, h] of d.f) {
       try {
-        feats.push(turf.polygon([ring], { _baseHeight: 0, _height: h, source: 'osm' }));
+        const f = turf.polygon([ring], { _baseHeight: 0, _height: h, source: 'osm' });
+        f.bbox = turf.bbox(f);
+        feats.push(f);
       } catch {}
     }
+    return { center: d.center, covered: d.covered, features: feats };
+  } catch { return null; }
+}
 
-    osmCache.center = obs;
-    osmCache.radius = radiusM;
-    osmCache.features = feats;
-    console.log(`[Isovist] OSM: ${feats.length} edifícios carregados`);
-    return feats;
-  } catch(e) {
-    console.warn('[Isovist] Overpass falhou:', e);
+function clearOSMStore() { try { localStorage.removeItem(OSM_STORE_KEY); } catch {} }
+
+async function overpassQuery(query) {
+  let lastErr;
+  for (const url of OSM_ENDPOINTS) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 20000);
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        body: 'data=' + encodeURIComponent(query),
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        signal: ctrl.signal,
+      });
+      if (!res.ok) throw new Error('Overpass HTTP ' + res.status);
+      return await res.json();
+    } catch (e) {
+      lastErr = e;
+      console.warn('[Isovist] Overpass falhou em', url, '→', e.message || e);
+    } finally { clearTimeout(timer); }
+  }
+  throw lastErr;
+}
+
+async function fetchOSMBuildings(obs, radiusM) {
+  // 1. Cache em memória cobre a área?
+  if (osmCovers(osmCache.center, osmCache.covered, obs, radiusM)) {
+    return osmNear(osmCache.features, obs, radiusM);
+  }
+  // 2. Já existe uma busca em andamento que cobre a área? Aguarda ela.
+  if (osmInflight && osmCovers(osmInflight.center, osmInflight.covered, obs, radiusM)) {
+    try { return osmNear(await osmInflight.promise, obs, radiusM); } catch {}
+  }
+  // 3. Área gravada no navegador (sessões anteriores)? Ignorada após o ↻.
+  if (!osmCache.forceRefresh) {
+    const stored = loadOSMStore();
+    if (stored && osmCovers(stored.center, stored.covered, obs, radiusM)) {
+      Object.assign(osmCache, { center: stored.center, radius: radiusM, covered: stored.covered, features: stored.features });
+      console.log(`[Isovist] OSM: ${stored.features.length} edifícios do cache local`);
+      return osmNear(stored.features, obs, radiusM);
+    }
+  }
+
+  // 4. Buscar com folga: cobre ajustes de raio e deslocamentos do observador
+  //    sem nova requisição. Mínimo 700m, máximo 2000m.
+  const covered = Math.min(2000, Math.max(700, radiusM * 1.2 * 1.6));
+  const center = obs;
+  setStatus('compute', 'Buscando edifícios do mapa (OSM)...');
+  const query = `[out:json][timeout:25];(way["building"](around:${Math.round(covered)},${obs[1]},${obs[0]}););out geom qt;`;
+
+  const promise = (async () => {
+    const data = await overpassQuery(query);
+    return parseOverpass(data);
+  })();
+  osmInflight = { center, covered, promise };
+
+  try {
+    const feats = await promise;
+    Object.assign(osmCache, { center, radius: radiusM, covered, features: feats, forceRefresh: false });
+    saveOSMStore(center, covered, feats);
+    console.log(`[Isovist] OSM: ${feats.length} edifícios carregados (área ${Math.round(covered)}m)`);
+    return osmNear(feats, obs, radiusM);
+  } catch (e) {
+    console.warn('[Isovist] Overpass indisponível:', e);
     setStatus('compute', 'OSM indisponível — usando só edifícios do projeto');
-    return osmCache.features || [];
+    return osmNear(osmCache.features || [], obs, radiusM);
+  } finally {
+    if (osmInflight && osmInflight.promise === promise) osmInflight = null;
   }
 }
 
@@ -1400,7 +1515,7 @@ document.getElementById('root').innerHTML = `
       <div class="legend-labels"><span>Bloqueado (perto)</span><span>Livre (longe)</span></div>
     </div>
   </div>
-  <footer class="ftr"><p>Beta V46 · © 2026 Königsberger Vannucchi</p></footer>
+  <footer class="ftr"><p>Beta V47 · © 2026 Königsberger Vannucchi</p></footer>
 </div>`;
 
 // ── Wire ─────────────────────────────────────────────────────────────────────
@@ -1593,7 +1708,7 @@ wireControl('d', v => S.coneDir = v);
 // Botão refazer análise: força re-leitura de obstáculos e OSM
 document.getElementById('btn-redo').addEventListener('click', async () => {
   if (!S.observer || S.status === 'compute') return;
-  osmCache.center = null; // força re-fetch do OSM
+  osmCache.center = null; osmCache.forceRefresh = true; clearOSMStore(); // força re-fetch do OSM
   // Se o observador veio de um elemento, re-lê a posição/altura atual dele
   if (S.observerFeatId) {
     let raw = giraffeState.get('rawSections') || [];
