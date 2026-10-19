@@ -405,7 +405,8 @@ import * as turf              from 'https://esm.sh/@turf/turf@6.5.0';
 const LO = 'isov';
 const RAY_STEP = 2;
 const SP_TAG = 'isovist_rose';
-let lastObstacleStats = { raw: 0, baked: 0 };  // origem dos obstáculos (diagnóstico)   // marcador das rosas permanentes (usado em getObstacles e renderPermanent)
+let lastObstacleStats = { raw: 0, baked: 0 };
+let lastTimings = { alturas: 0, osm: 0, raycast: 0, obstaculos: 0, noRaio: 0 };  // origem dos obstáculos (diagnóstico)   // marcador das rosas permanentes (usado em getObstacles e renderPermanent)
 
 const S = {
   observer: null, observerLabel: '', observerFeatId: null,
@@ -746,13 +747,19 @@ function topBaseFromEvaluated(parts) {
     const b = numOrNull(p._baseHeight) ?? numOrNull(p.baseHeight) ?? 0;
     let t = numOrNull(p._top) ?? numOrNull(p.top), s = 'top';
     if (t === null) {
+      const h   = numOrNull(p._height);
       const lv  = numOrNull(p._levels) ?? numOrNull(p.levels);
       const f2f = numOrNull(p._floorToFloor) ?? numOrNull(p.floorToFloor);
-      if (lv > 0 && f2f > 0) { t = b + lv * f2f; s = 'pavimentos × piso a piso'; }
-      else {
-        const h = numOrNull(p._height);
-        if (h > 0) { t = b + h; s = 'base + altura'; }
-      }
+      const rel = (lv > 0 && f2f > 0) ? lv * f2f : null;
+      if (h > 0) {
+        // _height do Giraffe é o TOPO ABSOLUTO da seção, já com a base empilhada
+        // (ex.: base 27,64 + 46 pav × 3,28 = 178,52 = _height). Só tratamos como
+        // altura relativa se os números provarem isso.
+        const relativo = h <= b ||
+          (rel !== null && b > 0.5 && Math.abs(h - rel) <= Math.max(0.1, rel * 0.01) && Math.abs(h - (b + rel)) > 0.5);
+        if (relativo) { t = b + h; s = 'base + altura'; }
+        else          { t = h;     s = 'topo avaliado'; }
+      } else if (rel !== null) { t = b + rel; s = 'base + pavimentos × piso a piso'; }
     }
     if (t !== null) { if (t > top) { top = t; src = s; } base = Math.min(base, b); }
   }
@@ -762,39 +769,70 @@ function topBaseFromEvaluated(parts) {
   return { top, base, src };
 }
 
+// Índice id → {top, base} montado a partir do bakedSections, que já traz as
+// seções avaliadas e empilhadas (_height, _baseHeight, _stackOrder...). Não
+// exige chamada ao Giraffe: é instantâneo. Reconstruído só quando muda.
+let bakedRef = null;
+let bakedTB = new Map();
+function refreshBakedHeights() {
+  let baked;
+  try { baked = giraffeState.get('bakedSections'); } catch { return; }
+  if (baked === bakedRef && bakedTB.size) return;
+  bakedRef = baked;
+  const groups = new Map();
+  for (const f of normalizeSections(baked)) {
+    const id = f?.properties?.id ?? f?.id;
+    if (id === undefined || id === null) continue;
+    if (!groups.has(id)) groups.set(id, []);
+    groups.get(id).push(f);
+  }
+  const m = new Map();
+  for (const [id, parts] of groups) { const tb = topBaseFromEvaluated(parts); if (tb) m.set(id, tb); }
+  bakedTB = m;
+}
+
 async function refreshEvalHeights() {
   if (!S.useEvalHeights) return;
-  const sig = envSignature();
-  if (sig === evalSig && evalHeights.size) return;          // entorno igual → cache vale
-  evalHeights.clear(); evalSig = sig;
+  refreshBakedHeights();
 
-  // Avalia TODOS os polígonos do projeto (menos as rosas): o empilhamento de
-  // uma torre depende do pódio abaixo dela, mesmo que o pódio esteja excluído.
   const raw = normalizeSections(giraffeState.get('rawSections')).filter(f => {
     const t = f?.geometry?.type;
     return (t === 'Polygon' || t === 'MultiPolygon') && f?.properties?.id
       && !(f.properties.sp_tag || '').startsWith(SP_TAG);
   });
   if (!raw.length) return;
+  const semBaked = raw.filter(f => !bakedTB.has(f.properties.id));
 
+  // Tudo coberto pelo bakedSections → nenhuma chamada ao Giraffe (rápido)
+  if (!semBaked.length) {
+    evalStatus = { ok: true, n: raw.length, total: raw.length, err: '', keys: '', fonte: 'bakedSections (instantâneo)' };
+    return;
+  }
+
+  // Só o que faltou vai para o evaluateFeatures, com cache por estado do entorno
+  const sig = envSignature();
+  if (sig === evalSig && semBaked.every(f => evalHeights.has(f.properties.id))) return;
+  evalHeights.clear(); evalSig = sig;
   try {
-    const res = await withTimeout(rpc.invoke('evaluateFeatures', [raw]), 6000);
+    // Envia o projeto todo: o empilhamento depende das seções de baixo
+    const res = await withTimeout(rpc.invoke('evaluateFeatures', [raw]), 4000);
     const byId = normalizeEvalResult(res);
     let n = 0;
-    for (const f of raw) {
+    for (const f of semBaked) {
       const id = f.properties.id;
       const tb = byId.has(id) ? topBaseFromEvaluated(byId.get(id)) : null;
       evalHeights.set(id, tb);
       if (tb) n++;
     }
     const sample = [...byId.values()][0]?.[0];
-    evalStatus = { ok: true, n, total: raw.length, err: '',
-      keys: Object.keys(sample?.properties || sample || {}).filter(k => /height|top|level|floor|base|stack/i.test(k)).join(', ') };
-    console.log(`[Isovist] alturas avaliadas pelo Giraffe: ${n}/${raw.length}`);
+    evalStatus = { ok: true, n: (raw.length - semBaked.length) + n, total: raw.length, err: '',
+      keys: Object.keys(sample?.properties || sample || {}).filter(k => /height|top|level|floor|base|stack/i.test(k)).join(', '),
+      fonte: `bakedSections + evaluateFeatures (${semBaked.length})` };
   } catch (e) {
-    for (const f of raw) evalHeights.set(f.properties.id, null);
-    evalStatus = { ok: false, n: 0, total: raw.length, err: String(e?.message || e), keys: '' };
-    console.warn('[Isovist] evaluateFeatures indisponível — usando regra anterior:', e);
+    for (const f of semBaked) evalHeights.set(f.properties.id, null);
+    evalStatus = { ok: raw.length > semBaked.length, n: raw.length - semBaked.length, total: raw.length,
+      err: String(e?.message || e), keys: '', fonte: 'bakedSections (evaluateFeatures falhou)' };
+    console.warn('[Isovist] evaluateFeatures indisponível — restante usa a regra anterior:', e);
   }
 }
 
@@ -802,7 +840,7 @@ function evalLookup(f) {
   if (!S.useEvalHeights) return null;
   const id = f?.properties?.id;
   if (!id || f.properties?.source === 'osm') return null;
-  return evalHeights.get(id) || null;
+  return bakedTB.get(id) || evalHeights.get(id) || null;
 }
 
 // Pontos de entrada usados pelo raycasting: valor avaliado → regra anterior
@@ -1138,12 +1176,16 @@ async function compute() {
     // Altura real dos edifícios do projeto (avaliada pelo Giraffe, com cache)
     if (S.useEvalHeights) {
       setStatus('compute', 'Lendo alturas reais dos edifícios...');
+      const tH0 = performance.now();
       await refreshEvalHeights();
+      lastTimings.alturas = Math.round(performance.now() - tH0);
       setStatus('compute', 'Coletando obstáculos...');
     }
     // Incluir edifícios do mapa base (OSM) se habilitado
     if (S.useOSM) {
+      const tO0 = performance.now();
       const osmFeats = await fetchOSMBuildings(obs, S.radius);
+      lastTimings.osm = Math.round(performance.now() - tO0);
       obstacles = obstacles.concat(osmFeats);
     }
     S.obstCount = obstacles.length;
@@ -1151,6 +1193,24 @@ async function compute() {
     const tall = obstacles.filter(f => blocksAtHeight(f, obsH));
     polys = flattenToPolygons(tall);
     setStatus('compute', `Raycasting contra ${polys.length} obstáculos...`);
+  }
+
+  // Pré-processar obstáculos UMA vez (antes, polygonToLine era refeito para
+  // cada raio × cada obstáculo). Obstáculos fora do círculo de análise são
+  // descartados: nenhum raio, que tem comprimento = raio, alcança eles.
+  const tRay0 = performance.now();
+  const prepared = [];
+  if (polys.length > 0) {
+    const rM = radiusKm * 1000 * 1.1;   // folga de 10% sobre a aproximação em graus
+    const dLat = rM / 111320, dLng = rM / (111320 * Math.cos(obs[1] * Math.PI / 180));
+    const cx0 = obs[0] - dLng, cx1 = obs[0] + dLng, cy0 = obs[1] - dLat, cy1 = obs[1] + dLat;
+    for (const poly of polys) {
+      try {
+        const bbox = turf.bbox(poly);
+        if (bbox[2] < cx0 || bbox[0] > cx1 || bbox[3] < cy0 || bbox[1] > cy1) continue;
+        prepared.push({ ring: turf.polygonToLine(poly), bbox });
+      } catch {}
+    }
   }
 
   // Disparar raios e criar wedges coloridos
@@ -1166,11 +1226,16 @@ async function compute() {
     let tipCoord = farCoord;
     let tipDist  = radiusKm;
 
-    if (polys.length > 0) {
+    if (prepared.length > 0) {
       const ray = turf.lineString([obs, farCoord]);
-      for (const poly of polys) {
+      // bbox do raio: obstáculo fora dele não pode ser cruzado
+      const rx0 = Math.min(obs[0], farCoord[0]), rx1 = Math.max(obs[0], farCoord[0]);
+      const ry0 = Math.min(obs[1], farCoord[1]), ry1 = Math.max(obs[1], farCoord[1]);
+      for (const P of prepared) {
+        const bb = P.bbox;
+        if (bb[2] < rx0 || bb[0] > rx1 || bb[3] < ry0 || bb[1] > ry1) continue;
         try {
-          const ring = turf.polygonToLine(poly);
+          const ring = P.ring;
           const hits = turf.lineIntersect(ray, ring);
           for (const hit of hits.features) {
             const d = turf.distance(obsP, hit, { units: 'kilometers' });
@@ -1200,6 +1265,10 @@ async function compute() {
   setStatus('compute', `Renderizando ${wedgeFeatures.length} fatias...`);
   const h = S.observerHeight;
 
+  lastTimings.raycast = Math.round(performance.now() - tRay0);
+  lastTimings.obstaculos = polys.length;
+  lastTimings.noRaio = prepared.length;
+  console.log('[Isovist] tempos (ms):', JSON.stringify(lastTimings));
   if (S.permanent) {
     // ── Modo permanente: cria seções reais no projeto (rawSections) ──────────
     // Para não pesar o modelo, agrupa fatias consecutivas de cor semelhante
@@ -1333,6 +1402,31 @@ async function ensurePermLayer(tag) {
   return name;
 }
 
+/* ─── Leque com geometria válida para o Giraffe ──────────────────────────────
+   Dois raios vizinhos que batem no mesmo ponto (ex.: quina de um edifício)
+   geram pontas idênticas, e o Giraffe recusa o polígono com "overlapping
+   vertices". Removemos pontas repetidas (consecutivas ou não, tolerância ~1cm),
+   pontas coincidentes com o observador e leques sem área.                   */
+const FAN_EPS = 1e-7;   // ~1cm em graus
+function cleanFanRing(obs, tips) {
+  const same = (a, b) => Math.abs(a[0] - b[0]) < FAN_EPS && Math.abs(a[1] - b[1]) < FAN_EPS;
+  const out = [];
+  for (const t of tips) {
+    if (!Array.isArray(t) || !Number.isFinite(t[0]) || !Number.isFinite(t[1])) continue;
+    if (same(t, obs)) continue;
+    if (out.some(o => same(o, t))) continue;
+    out.push(t);
+  }
+  if (out.length < 2) return null;
+  const ring = [obs, ...out, obs];
+  try {
+    const poly = turf.polygon([ring]);
+    if (turf.area(poly) < 0.01) return null;               // leque degenerado (sem área)
+    if (turf.kinks(poly).features.length) return null;     // autointerseção
+  } catch { return null; }
+  return ring;
+}
+
 async function renderPermanent(obs, wedges, h) {
   const tag = obsTag(obs); // tag único por ponto de observação
   const permLayer = (await ensurePermLayer(tag)) || 'default';
@@ -1360,11 +1454,14 @@ async function renderPermanent(obs, wedges, h) {
 
   // 2. Montar features leque com cor média do grupo
   const sectionFeatures = [];
+  let skippedFans = 0;
   for (const g of groups) {
     const avgRatio = g.ratios.reduce((a, b) => a + b, 0) / g.ratios.length;
     const color = distanceToColor(avgRatio);
     try {
-      const fan = turf.polygon([[obs, ...g.tips, obs]]);
+      const ring = cleanFanRing(obs, g.tips);
+      if (!ring) { skippedFans++; continue; }
+      const fan = turf.polygon([ring]);
       fan.properties = {
         layerId: permLayer,      // layer próprio da análise (fallback: 'default')
         sp_tag: tag,               // tag por ponto → permite substituição cirúrgica
@@ -1385,8 +1482,11 @@ async function renderPermanent(obs, wedges, h) {
     console.log(`[Isovist] ${sectionFeatures.length} seções criadas para tag ${tag} no layer "${permLayer}"`);
   } catch(e) {
     let err = e;
-    // Se o layer próprio foi recusado, tenta no 'default' (comportamento anterior)
-    if (permLayer !== 'default') {
+    if (skippedFans) console.warn(`[Isovist] ${skippedFans} leque(s) degenerado(s) descartado(s)`);
+    // Se o layer próprio foi recusado, tenta no 'default' (comportamento anterior).
+    // Erro de geometria não tem relação com o layer: repetir só duplicaria o aviso.
+    const erroGeometria = /vert|polygon|geometr|self|kink|coordinate/i.test(String(e?.message || e));
+    if (permLayer !== 'default' && !erroGeometria) {
       try {
         for (const sf of sectionFeatures) sf.properties.layerId = 'default';
         await rpc.invoke('createRawSections', [sectionFeatures]);
@@ -1793,7 +1893,7 @@ document.getElementById('root').innerHTML = `
       <div class="legend-labels"><span>Bloqueado (perto)</span><span>Livre (longe)</span></div>
     </div>
   </div>
-  <footer class="ftr"><p>Beta V51 · © 2026 Königsberger Vannucchi</p></footer>
+  <footer class="ftr"><p>Beta V53 · © 2026 Königsberger Vannucchi</p></footer>
 </div>`;
 
 // ── Wire ─────────────────────────────────────────────────────────────────────
@@ -1897,6 +1997,8 @@ document.getElementById('btn-diag').addEventListener('click', () => {
       lines.push('  exemplo baked: layer=' + p.layerId + ' id=' + p.id + ' _base=' + p._baseHeight + ' _height=' + p._height + ' levels=' + p.levels);
     }
     lines.push('');
+    lines.push('TEMPOS DA ÚLTIMA ANÁLISE (ms): alturas ' + lastTimings.alturas + ' · OSM ' + lastTimings.osm + ' · raycasting ' + lastTimings.raycast + '   obstáculos ' + lastTimings.obstaculos + ' (no raio: ' + lastTimings.noRaio + ')');
+    lines.push('');
     lines.push('SCENARIOS — filtro: ' + (S.onlyVisibleScenarios ? 'ligado' : 'desligado'));
     let vsRaw; try { vsRaw = giraffeState.get('visibleScenarios'); } catch { vsRaw = '(erro)'; }
     let vsTxt; try { vsTxt = JSON.stringify(vsRaw); } catch { vsTxt = String(vsRaw); }
@@ -1909,12 +2011,14 @@ document.getElementById('btn-diag').addEventListener('click', () => {
     lines.push('  elementos com scenario no projeto: ' + comSc.length);
     lines.push('');
     lines.push('ALTURAS — avaliação do Giraffe: ' + (S.useEvalHeights ? 'ligada' : 'desligada'));
-    if (evalStatus.ok === true)  lines.push('  avaliados: ' + evalStatus.n + '/' + evalStatus.total + '   campos: ' + (evalStatus.keys || '—'));
+    if (evalStatus.ok === true)  lines.push('  avaliados: ' + evalStatus.n + '/' + evalStatus.total + '   fonte: ' + (evalStatus.fonte || '—') + (evalStatus.keys ? '   campos: ' + evalStatus.keys : ''));
     if (evalStatus.ok === false) lines.push('  FALHOU (' + evalStatus.err + ') → usando regra anterior');
     if (evalStatus.ok === null)  lines.push('  ainda não executada — gere uma análise primeiro');
     lines.push('  piso a piso por uso: ' + (Object.keys(usageF2F).length ? JSON.stringify(usageF2F) : '(vazio → ' + DEFAULT_F2F + 'm)'));
     lines.push('  amostra (topo avaliado × regra anterior):');
-    for (const f of obsNow.filter(o => o.properties?.id && o.properties?.source !== 'osm').slice(0, 12)) {
+    const amostra = obsNow.filter(o => o.properties?.id && o.properties?.source !== 'osm')
+      .sort((a, b) => (Number(b.properties.stackOrder) || 0) - (Number(a.properties.stackOrder) || 0)).slice(0, 12);
+    for (const f of amostra) {
       const p = f.properties, ev = evalHeights.get(p.id);
       const ant = getBuildingTopChain(f);
       const evTxt = ev ? ev.base.toFixed(1) + '→' + ev.top.toFixed(1) + 'm (' + ev.src + ')' : 'sem dado';
