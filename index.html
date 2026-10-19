@@ -801,7 +801,8 @@ async function refreshEvalHeights() {
       && !(f.properties.sp_tag || '').startsWith(SP_TAG);
   });
   if (!raw.length) return;
-  const semBaked = raw.filter(f => !bakedTB.has(f.properties.id));
+  const temAltura = p => Number(p.levels) > 0 || Number(p.height) > 0 || Number(p._height) > 0;
+  const semBaked = raw.filter(f => temAltura(f.properties) && !bakedTB.has(f.properties.id));
 
   // Tudo coberto pelo bakedSections → nenhuma chamada ao Giraffe (rápido)
   if (!semBaked.length) {
@@ -809,10 +810,11 @@ async function refreshEvalHeights() {
     return;
   }
 
-  // Só o que faltou vai para o evaluateFeatures, com cache por estado do entorno
-  const sig = envSignature();
-  if (sig === evalSig && semBaked.every(f => evalHeights.has(f.properties.id))) return;
-  evalHeights.clear(); evalSig = sig;
+  // Só o que faltou vai para o evaluateFeatures — UMA vez por sessão (ou após ↻).
+  // Chamá-lo a cada mudança no entorno deixava o app lento.
+  if (evalSig !== null) return;
+  evalSig = 'tentado';
+  evalHeights.clear();
   try {
     // Envia o projeto todo: o empilhamento depende das seções de baixo
     const res = await withTimeout(rpc.invoke('evaluateFeatures', [raw]), 4000);
@@ -1156,6 +1158,66 @@ async function fetchOSMBuildings(obs, radiusM) {
 }
 
 // ─── Cálculo: wedges coloridos por distância (estilo Ladybug) ─────────────────
+/* ─── Cache de obstáculos ─────────────────────────────────────────────────────
+   Assinatura do projeto: id, layer, scenario, pavimentos, piso a piso, alturas,
+   empilhamento, uso e posição de cada elemento (exceto as próprias rosas).
+   Enquanto ela não muda, a lista de obstáculos e as alturas são reaproveitadas. */
+let obstCache = { key: null, list: [] };
+const partsCache = new WeakMap();   // elemento → [{ ring, bbox }] (calculado uma vez)
+
+function projSignature() {
+  let h = 2166136261 >>> 0, n = 0;
+  const hs = v => { const s = String(v ?? ''); for (let i = 0; i < s.length; i++) h = Math.imul(h ^ s.charCodeAt(i), 16777619) >>> 0; h = Math.imul(h ^ 124, 16777619) >>> 0; };
+  for (const f of normalizeSections(giraffeState.get('rawSections'))) {
+    const p = f?.properties || {};
+    if ((p.sp_tag || '').startsWith(SP_TAG)) continue;
+    const g = f?.geometry;
+    if (!g?.coordinates) continue;
+    let c = g.coordinates; while (Array.isArray(c[0])) c = c[0];
+    hs(p.id); hs(p.layerId); hs(p.levels); hs(p.floorToFloor); hs(p.height); hs(p._height);
+    hs(p.baseHeight); hs(p._baseHeight); hs(p.stackOrder); hs(p.usage);
+    hs(Array.isArray(p.scenario) ? p.scenario.join(',') : ''); hs(g.type); hs(c[0]); hs(c[1]);
+    n++;
+  }
+  return h + ':' + n;
+}
+
+function obstacleCacheKey() {
+  let bakedLen = 0;
+  try { bakedLen = normalizeSections(giraffeState.get('bakedSections')).length; } catch {}
+  return [projSignature(), bakedLen,
+    S.onlyVisible ? hiddenSignature() : '-',
+    S.onlyVisibleScenarios ? scenarioSignature() : '-',
+    [...S.excludedLayers].sort().join('|'),
+    S.useEvalHeights, S.observerFeatId || ''].join('§');
+}
+
+async function getProjectObstacles() {
+  const key = obstacleCacheKey();
+  if (key === obstCache.key) { lastTimings.cache = 'sim'; return obstCache.list; }
+  const list = getObstacles(S.observerFeatId);
+  if (S.useEvalHeights) {
+    setStatus('compute', 'Lendo alturas reais dos edifícios...');
+    const tH0 = performance.now();
+    await refreshEvalHeights();
+    lastTimings.alturas = Math.round(performance.now() - tH0);
+  }
+  obstCache = { key, list };
+  lastTimings.cache = 'não';
+  return list;
+}
+
+function getParts(f) {
+  let parts = partsCache.get(f);
+  if (parts) return parts;
+  parts = [];
+  for (const poly of flattenToPolygons([f])) {
+    try { parts.push({ ring: turf.polygonToLine(poly), bbox: turf.bbox(poly) }); } catch {}
+  }
+  partsCache.set(f, parts);
+  return parts;
+}
+
 async function compute() {
   const obs = S.observer;
   if (!obs) return;
@@ -1169,18 +1231,16 @@ async function compute() {
   const obsH     = S.observerHeight;
 
   // Coletar e filtrar obstáculos (se toggle ON)
+  // A lista de obstáculos do projeto fica em cache e só é refeita quando o
+  // projeto muda (elementos, layers ocultos, scenarios, exclusões). Mudar a
+  // altura do observador, o cone ou o raio reaproveita tudo.
   let polys = [];
+  const prepared = [];
   if (S.useObs) {
     setStatus('compute', 'Coletando obstáculos...');
-    let obstacles = getObstacles(S.observerFeatId);
-    // Altura real dos edifícios do projeto (avaliada pelo Giraffe, com cache)
-    if (S.useEvalHeights) {
-      setStatus('compute', 'Lendo alturas reais dos edifícios...');
-      const tH0 = performance.now();
-      await refreshEvalHeights();
-      lastTimings.alturas = Math.round(performance.now() - tH0);
-      setStatus('compute', 'Coletando obstáculos...');
-    }
+    const tC0 = performance.now();
+    let obstacles = await getProjectObstacles();
+    lastTimings.coleta = Math.round(performance.now() - tC0);
     // Incluir edifícios do mapa base (OSM) se habilitado
     if (S.useOSM) {
       const tO0 = performance.now();
@@ -1191,27 +1251,24 @@ async function compute() {
     S.obstCount = obstacles.length;
     // Mesma lógica de altura do castRaysTurf (getBuildingTop compartilhado)
     const tall = obstacles.filter(f => blocksAtHeight(f, obsH));
-    polys = flattenToPolygons(tall);
-    setStatus('compute', `Raycasting contra ${polys.length} obstáculos...`);
-  }
-
-  // Pré-processar obstáculos UMA vez (antes, polygonToLine era refeito para
-  // cada raio × cada obstáculo). Obstáculos fora do círculo de análise são
-  // descartados: nenhum raio, que tem comprimento = raio, alcança eles.
-  const tRay0 = performance.now();
-  const prepared = [];
-  if (polys.length > 0) {
+    // Obstáculos fora do círculo de análise são descartados: nenhum raio, que
+    // tem comprimento = raio, alcança eles. O contorno de cada polígono é
+    // calculado uma única vez por elemento e reaproveitado (getParts).
     const rM = radiusKm * 1000 * 1.1;   // folga de 10% sobre a aproximação em graus
     const dLat = rM / 111320, dLng = rM / (111320 * Math.cos(obs[1] * Math.PI / 180));
     const cx0 = obs[0] - dLng, cx1 = obs[0] + dLng, cy0 = obs[1] - dLat, cy1 = obs[1] + dLat;
-    for (const poly of polys) {
-      try {
-        const bbox = turf.bbox(poly);
-        if (bbox[2] < cx0 || bbox[0] > cx1 || bbox[3] < cy0 || bbox[1] > cy1) continue;
-        prepared.push({ ring: turf.polygonToLine(poly), bbox });
-      } catch {}
+    for (const f of tall) {
+      for (const P of getParts(f)) {
+        polys.push(P);
+        const bb = P.bbox;
+        if (bb[2] < cx0 || bb[0] > cx1 || bb[3] < cy0 || bb[1] > cy1) continue;
+        prepared.push(P);
+      }
     }
+    setStatus('compute', `Raycasting contra ${prepared.length} obstáculos...`);
+    await new Promise(r => setTimeout(r, 0));   // deixa a tela mostrar o status real
   }
+  const tRay0 = performance.now();
 
   // Disparar raios e criar wedges coloridos
   const wedgeFeatures = [];
@@ -1547,8 +1604,14 @@ function renderInfo() {
 }
 function scheduleRecompute() { if (!S.observer) return; clearTimeout(debounce); debounce = setTimeout(runCompute, 350); }
 
+// Fila de cálculos: se uma análise já está rodando (ex.: arrastando o slider),
+// as próximas não começam por cima dela — o app guarda só o pedido mais
+// recente e o executa assim que a atual terminar.
+let computing = false, pendingCompute = false;
 async function runCompute() {
   if (!S.observer) return;
+  if (computing) { pendingCompute = true; return; }
+  computing = true;
   const t0 = performance.now();
   try {
     const n = await compute();
@@ -1556,7 +1619,9 @@ async function runCompute() {
     const hTxt = S.observerHeight > 0 ? ` · h=${Math.round(S.observerHeight)}m` : '';
     setStatus('done', `${n || 0} fatias${hTxt} · ${S.computeMs}ms`);
   } catch (e) { console.error(e); setStatus('error', String(e)); }
+  finally { computing = false; }
   renderBtns();
+  if (pendingCompute) { pendingCompute = false; await runCompute(); }
 }
 
 
@@ -1772,7 +1837,17 @@ function readObserverFromFeature(f) {
   const isPoint = f.geometry?.type === 'Point';
   // PONTO: usa o _baseHeight direto (onde o ponto está posicionado no 3D).
   // POLÍGONO: usa o topo (base + altura do edifício).
-  const height = isPoint ? (bh || coordZ) : (bh + ht) || coordZ;
+  // POLÍGONO: _height do Giraffe já é o TOPO absoluto (com a base empilhada).
+  // Somar _baseHeight a ele colocava o observador acima do topo em edifícios
+  // empilhados (ex.: 27,64 + 178,52 = 206m, topo real 178,52m).
+  let topoEdif = null;
+  if (!isPoint) {
+    try {
+      if (S.useEvalHeights) { refreshBakedHeights(); const tb = props.id && bakedTB.get(props.id); if (tb) topoEdif = tb.top; }
+      if (topoEdif === null && numOrNull(props._height) > 0) { const tb = topBaseFromEvaluated([{ properties: props }]); if (tb) topoEdif = tb.top; }
+    } catch {}
+  }
+  const height = isPoint ? (bh || coordZ) : (topoEdif ?? ((bh + ht) || coordZ));
   return {
     coord: c,
     height,
@@ -1893,7 +1968,7 @@ document.getElementById('root').innerHTML = `
       <div class="legend-labels"><span>Bloqueado (perto)</span><span>Livre (longe)</span></div>
     </div>
   </div>
-  <footer class="ftr"><p>Beta V53 · © 2026 Königsberger Vannucchi</p></footer>
+  <footer class="ftr"><p>Beta V54 · © 2026 Königsberger Vannucchi</p></footer>
 </div>`;
 
 // ── Wire ─────────────────────────────────────────────────────────────────────
@@ -1997,7 +2072,7 @@ document.getElementById('btn-diag').addEventListener('click', () => {
       lines.push('  exemplo baked: layer=' + p.layerId + ' id=' + p.id + ' _base=' + p._baseHeight + ' _height=' + p._height + ' levels=' + p.levels);
     }
     lines.push('');
-    lines.push('TEMPOS DA ÚLTIMA ANÁLISE (ms): alturas ' + lastTimings.alturas + ' · OSM ' + lastTimings.osm + ' · raycasting ' + lastTimings.raycast + '   obstáculos ' + lastTimings.obstaculos + ' (no raio: ' + lastTimings.noRaio + ')');
+    lines.push('TEMPOS DA ÚLTIMA ANÁLISE (ms): coleta ' + (lastTimings.coleta ?? 0) + ' (cache: ' + (lastTimings.cache || '—') + ') · alturas ' + lastTimings.alturas + ' · OSM ' + lastTimings.osm + ' · raycasting ' + lastTimings.raycast + '   obstáculos ' + lastTimings.obstaculos + ' (no raio: ' + lastTimings.noRaio + ')');
     lines.push('');
     lines.push('SCENARIOS — filtro: ' + (S.onlyVisibleScenarios ? 'ligado' : 'desligado'));
     let vsRaw; try { vsRaw = giraffeState.get('visibleScenarios'); } catch { vsRaw = '(erro)'; }
@@ -2119,7 +2194,7 @@ wireControl('d', v => S.coneDir = v);
 // Botão refazer análise: força re-leitura de obstáculos e OSM
 document.getElementById('btn-redo').addEventListener('click', async () => {
   if (!S.observer || S.status === 'compute') return;
-  osmCache.center = null; osmCache.forceRefresh = true; clearOSMStore(); evalSig = null; // força re-fetch do OSM e releitura das alturas
+  osmCache.center = null; osmCache.forceRefresh = true; clearOSMStore(); evalSig = null; obstCache.key = null; // força re-fetch do OSM e releitura das alturas
   // Se o observador veio de um elemento, re-lê a posição/altura atual dele
   if (S.observerFeatId) {
     let raw = giraffeState.get('rawSections') || [];
