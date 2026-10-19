@@ -416,6 +416,7 @@ const S = {
   onlyVisible: true,   // ignorar elementos em layers ocultos
   excludedLayers: new Set(),  // layers excluídos manualmente pelo usuário
   autoSync: true,      // recalcular ao mover o elemento observador ou o entorno
+  permLayers: {},      // tag da análise → nome do drawing layer permanente
   observerIsPoint: false,  // true = ponto (herda Z sempre) | false = edifício
   manualHeight: false,     // usuário editou a altura à mão → respeitar em edifícios        // incluir edifícios do mapa base (OSM)
   permanent: false,     // renderizar em layer permanente (rawSections)
@@ -1077,8 +1078,63 @@ async function deleteObsSections(tag) {
   } catch(e) { console.warn('[Isovist] deleteObsSections:', e); }
 }
 
+/* ─── Layer próprio para cada análise permanente ──────────────────────────────
+   Cada análise (identificada pela tag do observador) ganha um drawing layer com
+   nome próprio, criado UMA vez. Recalcular a mesma análise (mover o observador,
+   mudar raio/altura/cone) reaproveita o mesmo layer. Se a criação falhar, o app
+   volta ao layer 'default', que era o comportamento anterior.               */
+const PERM_LAYER_PREFIX = 'Rosa dos Visuais';
+
+function drawingLayerNames() {
+  const names = new Set();
+  try {
+    const tree = giraffeState.get('layerTree');
+    for (const id of Object.keys(tree?.items || {})) {
+      const m = id.match(GIRDRW_RE);
+      if (m) names.add(m[1]);
+    }
+  } catch {}
+  try {
+    for (const f of normalizeSections(giraffeState.get('rawSections'))) {
+      const l = f?.properties?.layerId;
+      if (l) names.add(l);
+    }
+  } catch {}
+  return names;
+}
+
+function newPermLayerName() {
+  const used = [...drawingLayerNames(), ...Object.values(S.permLayers)];
+  let n = 1;
+  const re = new RegExp('^' + PERM_LAYER_PREFIX + ' (\\d+)');
+  for (const nm of used) {
+    const m = String(nm).match(re);
+    if (m) n = Math.max(n, Number(m[1]) + 1);
+  }
+  const pad = x => String(x).padStart(2, '0');
+  const d = new Date();
+  const tipo = /Edif/i.test(S.observerLabel || '') ? 'Edifício' : 'Ponto';
+  return `${PERM_LAYER_PREFIX} ${pad(n)} · ${tipo} · ${pad(d.getDate())}.${pad(d.getMonth() + 1)} ${pad(d.getHours())}h${pad(d.getMinutes())}`;
+}
+
+async function ensurePermLayer(tag) {
+  let name = S.permLayers[tag];
+  if (!name) { name = newPermLayerName(); S.permLayers[tag] = name; }
+  if (!drawingLayerNames().has(name)) {
+    try {
+      await rpc.invoke('createDrawingLayer', [name]);
+      console.log('[Isovist] layer criado:', name);
+    } catch (e) {
+      console.warn('[Isovist] createDrawingLayer falhou, usando "default":', e);
+      return null;
+    }
+  }
+  return name;
+}
+
 async function renderPermanent(obs, wedges, h) {
   const tag = obsTag(obs); // tag único por ponto de observação
+  const permLayer = (await ensurePermLayer(tag)) || 'default';
 
   // 1. Agrupar wedges consecutivos por bucket de cor (12 níveis)
   const BUCKETS = 12;
@@ -1109,7 +1165,7 @@ async function renderPermanent(obs, wedges, h) {
     try {
       const fan = turf.polygon([[obs, ...g.tips, obs]]);
       fan.properties = {
-        layerId: 'default',
+        layerId: permLayer,      // layer próprio da análise (fallback: 'default')
         sp_tag: tag,               // tag por ponto → permite substituição cirúrgica
         color: color,
         baseHeight: h,
@@ -1125,10 +1181,20 @@ async function renderPermanent(obs, wedges, h) {
   await deleteObsSections(tag);
   try {
     await rpc.invoke('createRawSections', [sectionFeatures]);
-    console.log(`[Isovist] ${sectionFeatures.length} seções criadas para tag ${tag}`);
+    console.log(`[Isovist] ${sectionFeatures.length} seções criadas para tag ${tag} no layer "${permLayer}"`);
   } catch(e) {
-    console.error('[Isovist] createRawSections:', e);
-    setStatus('error', 'Falha ao criar seções permanentes: ' + e);
+    let err = e;
+    // Se o layer próprio foi recusado, tenta no 'default' (comportamento anterior)
+    if (permLayer !== 'default') {
+      try {
+        for (const sf of sectionFeatures) sf.properties.layerId = 'default';
+        await rpc.invoke('createRawSections', [sectionFeatures]);
+        console.warn(`[Isovist] layer "${permLayer}" recusado — seções criadas no "default"`);
+        return;
+      } catch (e2) { err = e2; }
+    }
+    console.error('[Isovist] createRawSections:', err);
+    setStatus('error', 'Falha ao criar seções permanentes: ' + err);
   }
 }
 
@@ -1515,7 +1581,7 @@ document.getElementById('root').innerHTML = `
       <div class="legend-labels"><span>Bloqueado (perto)</span><span>Livre (longe)</span></div>
     </div>
   </div>
-  <footer class="ftr"><p>Beta V47 · © 2026 Königsberger Vannucchi</p></footer>
+  <footer class="ftr"><p>Beta V48 · © 2026 Königsberger Vannucchi</p></footer>
 </div>`;
 
 // ── Wire ─────────────────────────────────────────────────────────────────────
@@ -1548,6 +1614,7 @@ function listLayerIds() {
   for (const f of raw) {
     const lid = f?.properties?.layerId;
     if (!lid) continue;
+    if ((f?.properties?.sp_tag || '').startsWith(SP_TAG)) continue;  // rosas: já ignoradas
     const geom = f.geometry?.type;
     if (geom !== 'Polygon' && geom !== 'MultiPolygon') continue;
     counts[lid] = (counts[lid] || 0) + 1;
@@ -1787,6 +1854,7 @@ function snapshotState() {
     onlyVisible: S.onlyVisible, autoSync: S.autoSync,
     excludedLayers: [...S.excludedLayers],
     palette: activePalette,
+    permLayers: S.permLayers,
     lastTrackSig,
   });
 }
@@ -1826,6 +1894,7 @@ function restoreState() {
     if (typeof d[k] === 'boolean') { S[k] = d[k]; setToggleUI(id, d[k]); }
   }
   if (Array.isArray(d.excludedLayers)) S.excludedLayers = new Set(d.excludedLayers);
+  if (d.permLayers && typeof d.permLayers === 'object') S.permLayers = d.permLayers;
   if (d.palette && PALETTES[d.palette]) {
     activePalette = d.palette;
     palSel.value = d.palette;
