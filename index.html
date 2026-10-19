@@ -419,6 +419,7 @@ const S = {
   permLayers: {},      // tag da análise → nome do drawing layer permanente
   useEvalHeights: true, // altura real dos edifícios avaliada pelo Giraffe
   permSeq: 0,          // último número usado em 'Rosa dos Visuais NN'
+  onlyVisibleScenarios: true, // ignorar elementos em scenarios ocultos
   observerIsPoint: false,  // true = ponto (herda Z sempre) | false = edifício
   manualHeight: false,     // usuário editou a altura à mão → respeitar em edifícios        // incluir edifícios do mapa base (OSM)
   permanent: false,     // renderizar em layer permanente (rawSections)
@@ -498,11 +499,55 @@ function normalizeSections(v) {
   return [];
 }
 
+/* ─── Scenarios ocultos ───────────────────────────────────────────────────────
+   Cada elemento pode pertencer a scenarios (properties.scenario = [ids]). O
+   giraffeState expõe 'visibleScenarios'. Regra: um elemento que pertence a
+   scenarios só obstrui se PELO MENOS UM deles estiver visível. Elementos sem
+   scenario seguem sempre valendo. Se a chave não existir ou vier num formato
+   desconhecido, retorna null e o filtro não age (análise igual à anterior). */
+function getVisibleScenarioSet() {
+  let v;
+  try { v = giraffeState.get('visibleScenarios'); } catch { return null; }
+  if (v === undefined || v === null) return null;
+  const ids = new Set();
+  const add = x => {
+    if (typeof x === 'string' || typeof x === 'number') ids.add(String(x));
+    else if (x && typeof x === 'object') {
+      const id = x.id ?? x.uuid ?? x.key ?? x.scenarioId;
+      if (id !== undefined && id !== null && x.visible !== false && x.hidden !== true) ids.add(String(id));
+    }
+  };
+  if (v instanceof Set || Array.isArray(v)) { v.forEach(add); return ids; }
+  if (typeof v === 'object') {
+    if (Array.isArray(v.ids)) { v.ids.forEach(add); return ids; }
+    for (const [k, val] of Object.entries(v)) {
+      if (val === true) ids.add(k);
+      else if (val && typeof val === 'object') add({ id: val.id ?? k, visible: val.visible, hidden: val.hidden });
+    }
+    return ids;
+  }
+  return null;
+}
+
+function hiddenByScenario(f, visibleSet) {
+  if (!visibleSet) return false;
+  const sc = f?.properties?.scenario;
+  if (!Array.isArray(sc) || !sc.length) return false;      // fora de scenarios → vale sempre
+  return !sc.some(id => visibleSet.has(String(id)));
+}
+
+function scenarioSignature() {
+  const s = getVisibleScenarioSet();
+  return s === null ? 'null' : [...s].sort().join('|');
+}
+
 function getObstacles(excludeId) {
   const raw = normalizeSections(giraffeState.get('rawSections'));
   if (!raw.length) return [];
   // Layers ocultos: null = não foi possível detectar → filtro desligado
   const hidden = S.onlyVisible ? getHiddenLayerNames() : null;
+  const visSc  = S.onlyVisibleScenarios ? getVisibleScenarioSet() : null;
+  let scenarioOut = 0;
 
   const isValid = f => {
     if (!f?.geometry) return false;
@@ -520,6 +565,8 @@ function getObstacles(excludeId) {
     // Ignorar layers excluídos manualmente pelo usuário
     if (lid && S.excludedLayers.has(lid)) return false;
     if (excludeId && f.properties?.id === excludeId) return false;
+    // Ignorar elementos cujos scenarios estão todos ocultos
+    if (hiddenByScenario(f, visSc)) { scenarioOut++; return false; }
     return true;
   };
 
@@ -550,7 +597,7 @@ function getObstacles(excludeId) {
     }
   } catch (e) { console.warn('[Isovist] bakedSections indisponível:', e); }
 
-  lastObstacleStats = { raw: fromRaw.length, baked: fromBaked.length };
+  lastObstacleStats = { raw: fromRaw.length, baked: fromBaked.length, scenario: scenarioOut };
   return fromRaw.concat(fromBaked);
 }
 
@@ -1452,6 +1499,7 @@ function inheritPointHeight(coord) {
    Qualquer mudança agenda um recompute com debounce.                          */
 let lastTrackSig = '';
 let lastEnvSig   = 0;
+let lastScenarioSig = null;   // assinatura dos scenarios visíveis
 let syncTimer    = null;
 
 function hashNum(h, v) { return Math.imul(h ^ (v | 0), 16777619) >>> 0; }
@@ -1574,6 +1622,14 @@ setInterval(() => {
         renderObs();
         scheduleSync(herdarAltura ? 'observador movido' : 'observador movido (altura manual mantida)');
       }
+    }
+
+    // ── 1b. Scenarios visíveis mudaram? ───────────────────────────────────
+    const scs = scenarioSignature();
+    if (scs !== lastScenarioSig) {
+      const primeira = lastScenarioSig === null;
+      lastScenarioSig = scs;
+      if (!primeira && S.onlyVisibleScenarios) scheduleSync('scenario alterado');
     }
 
     // ── 2. O entorno mudou? ───────────────────────────────────────────────
@@ -1705,6 +1761,7 @@ document.getElementById('root').innerHTML = `
     <div class="toggle-row"><button class="toggle" id="toggle-osm" aria-label="Incluir edifícios OSM" role="switch" aria-checked="true"></button><span class="toggle-label">Incluir edifícios do mapa base (OSM)</span></div>
     <div class="toggle-row"><button class="toggle" id="toggle-evalh" aria-label="Usar altura real dos edifícios avaliada pelo Giraffe" role="switch" aria-checked="true"></button><span class="toggle-label">Altura real dos edifícios (Giraffe)</span></div>
     <div class="toggle-row"><button class="toggle" id="toggle-vis" aria-label="Ignorar elementos em layers ocultos" role="switch" aria-checked="true"></button><span class="toggle-label">Ignorar layers ocultos (automático)</span></div>
+    <div class="toggle-row"><button class="toggle" id="toggle-scn" aria-label="Ignorar elementos em scenarios ocultos" role="switch" aria-checked="true"></button><span class="toggle-label">Ignorar scenarios ocultos</span></div>
     <div class="toggle-row"><button class="toggle" id="toggle-sync" aria-label="Sincronização automática" role="switch" aria-checked="true"></button><span class="toggle-label">Sincronização automática</span></div>
     <div id="sync-status" style="font-size:9.5px;color:var(--md-sys-color-outline);padding:0 0 2px 46px;min-height:13px" aria-live="polite"></div>
 
@@ -1736,7 +1793,7 @@ document.getElementById('root').innerHTML = `
       <div class="legend-labels"><span>Bloqueado (perto)</span><span>Livre (longe)</span></div>
     </div>
   </div>
-  <footer class="ftr"><p>Beta V50 · © 2026 Königsberger Vannucchi</p></footer>
+  <footer class="ftr"><p>Beta V51 · © 2026 Königsberger Vannucchi</p></footer>
 </div>`;
 
 // ── Wire ─────────────────────────────────────────────────────────────────────
@@ -1752,6 +1809,8 @@ document.getElementById('toggle-evalh').addEventListener('click', function () { 
 document.getElementById('toggle-evalh').className = 'toggle' + (S.useEvalHeights ? ' on' : '');
 document.getElementById('toggle-vis').addEventListener('click', function () { S.onlyVisible = !S.onlyVisible; this.className = 'toggle' + (S.onlyVisible ? ' on' : ''); this.setAttribute('aria-checked', S.onlyVisible); renderLayerList(); scheduleRecompute(); });
 document.getElementById('toggle-vis').className = 'toggle' + (S.onlyVisible ? ' on' : '');
+document.getElementById('toggle-scn').addEventListener('click', function () { S.onlyVisibleScenarios = !S.onlyVisibleScenarios; this.className = 'toggle' + (S.onlyVisibleScenarios ? ' on' : ''); this.setAttribute('aria-checked', S.onlyVisibleScenarios); scheduleRecompute(); });
+document.getElementById('toggle-scn').className = 'toggle' + (S.onlyVisibleScenarios ? ' on' : '');
 document.getElementById('toggle-sync').addEventListener('click', function () {
   S.autoSync = !S.autoSync;
   this.className = 'toggle' + (S.autoSync ? ' on' : '');
@@ -1837,6 +1896,17 @@ document.getElementById('btn-diag').addEventListener('click', () => {
       const p = bp.properties || {};
       lines.push('  exemplo baked: layer=' + p.layerId + ' id=' + p.id + ' _base=' + p._baseHeight + ' _height=' + p._height + ' levels=' + p.levels);
     }
+    lines.push('');
+    lines.push('SCENARIOS — filtro: ' + (S.onlyVisibleScenarios ? 'ligado' : 'desligado'));
+    let vsRaw; try { vsRaw = giraffeState.get('visibleScenarios'); } catch { vsRaw = '(erro)'; }
+    let vsTxt; try { vsTxt = JSON.stringify(vsRaw); } catch { vsTxt = String(vsRaw); }
+    if (vsTxt && vsTxt.length > 600) vsTxt = vsTxt.slice(0, 600) + '…';
+    const vsSet = getVisibleScenarioSet();
+    lines.push('  visibleScenarios (bruto): ' + vsTxt);
+    lines.push('  visíveis interpretados: ' + (vsSet === null ? '(não detectado → filtro não age)' : (vsSet.size ? [...vsSet].join(', ') : '(nenhum)')));
+    lines.push('  obstáculos ignorados por scenario: ' + (lastObstacleStats.scenario || 0));
+    const comSc = normalizeSections(giraffeState.get('rawSections')).filter(f => Array.isArray(f?.properties?.scenario) && f.properties.scenario.length);
+    lines.push('  elementos com scenario no projeto: ' + comSc.length);
     lines.push('');
     lines.push('ALTURAS — avaliação do Giraffe: ' + (S.useEvalHeights ? 'ligada' : 'desligada'));
     if (evalStatus.ok === true)  lines.push('  avaliados: ' + evalStatus.n + '/' + evalStatus.total + '   campos: ' + (evalStatus.keys || '—'));
@@ -2021,7 +2091,7 @@ function snapshotState() {
     observerHeight: S.observerHeight, observerIsPoint: S.observerIsPoint, manualHeight: S.manualHeight,
     radius: S.radius, cone: S.cone, coneDir: S.coneDir,
     useObs: S.useObs, useOSM: S.useOSM, permanent: S.permanent,
-    onlyVisible: S.onlyVisible, autoSync: S.autoSync, useEvalHeights: S.useEvalHeights,
+    onlyVisible: S.onlyVisible, autoSync: S.autoSync, useEvalHeights: S.useEvalHeights, onlyVisibleScenarios: S.onlyVisibleScenarios,
     excludedLayers: [...S.excludedLayers],
     palette: activePalette,
     permLayers: S.permLayers, permSeq: S.permSeq,
@@ -2060,7 +2130,7 @@ function restoreState() {
   }
   if (Number.isFinite(d.coneDir)) { S.coneDir = d.coneDir; syncControl('d', d.coneDir); }
   for (const [k, id] of [['useObs','toggle-obs'],['useOSM','toggle-osm'],['permanent','toggle-perm'],
-                         ['onlyVisible','toggle-vis'],['autoSync','toggle-sync'],['useEvalHeights','toggle-evalh']]) {
+                         ['onlyVisible','toggle-vis'],['autoSync','toggle-sync'],['useEvalHeights','toggle-evalh'],['onlyVisibleScenarios','toggle-scn']]) {
     if (typeof d[k] === 'boolean') { S[k] = d[k]; setToggleUI(id, d[k]); }
   }
   if (Array.isArray(d.excludedLayers)) S.excludedLayers = new Set(d.excludedLayers);
