@@ -1089,37 +1089,49 @@ function loadOSMStore() {
 function clearOSMStore() { try { localStorage.removeItem(OSM_STORE_KEY); } catch {} }
 
 async function overpassQuery(query) {
-  let lastErr;
-  for (const url of OSM_ENDPOINTS) {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 20000);
-    try {
+  // Os servidores são consultados EM PARALELO: vale o primeiro que responder e
+  // os demais são cancelados. Antes, eram tentados um após o outro, e com o
+  // Overpass sobrecarregado a espera chegava a 3 × 20s = 60s.
+  const ctrls = OSM_ENDPOINTS.map(() => new AbortController());
+  const timer = setTimeout(() => ctrls.forEach(c => c.abort()), 15000);
+  try {
+    return await Promise.any(OSM_ENDPOINTS.map(async (url, k) => {
       const res = await fetch(url, {
         method: 'POST',
         body: 'data=' + encodeURIComponent(query),
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        signal: ctrl.signal,
+        signal: ctrls[k].signal,
       });
-      if (!res.ok) throw new Error('Overpass HTTP ' + res.status);
-      return await res.json();
-    } catch (e) {
-      lastErr = e;
-      console.warn('[Isovist] Overpass falhou em', url, '→', e.message || e);
-    } finally { clearTimeout(timer); }
-  }
-  throw lastErr;
+      if (!res.ok) throw new Error(url + ' HTTP ' + res.status);
+      const json = await res.json();
+      ctrls.forEach((c, n) => { if (n !== k) c.abort(); });
+      return json;
+    }));
+  } catch (e) {
+    const motivos = (e?.errors || [e]).map(x => x?.name === 'AbortError' ? 'tempo esgotado' : (x?.message || String(x)));
+    console.warn('[Isovist] Overpass indisponível em todos os servidores:', motivos);
+    throw new Error(motivos.join(' | '));
+  } finally { clearTimeout(timer); }
 }
 
-async function fetchOSMBuildings(obs, radiusM) {
-  // 1. Cache em memória cobre a área?
-  if (osmCovers(osmCache.center, osmCache.covered, obs, radiusM)) {
-    return osmNear(osmCache.features, obs, radiusM);
-  }
-  // 2. Já existe uma busca em andamento que cobre a área? Aguarda ela.
-  if (osmInflight && osmCovers(osmInflight.center, osmInflight.covered, obs, radiusM)) {
-    try { return osmNear(await osmInflight.promise, obs, radiusM); } catch {}
-  }
-  // 3. Área gravada no navegador (sessões anteriores)? Ignorada após o ↻.
+/* A análise NUNCA espera pelo OSM. Se a área já está em cache (memória ou
+   navegador), os edifícios entram na hora. Se não está, a análise é feita com
+   os edifícios do projeto, a busca segue em segundo plano e a rosa é
+   recalculada sozinha quando os edifícios OSM chegarem. Se o Overpass falhar,
+   o app espera 2 minutos antes de tentar de novo (ou até o ↻).          */
+const OSM_RETRY_MS = 120000;
+const osmState = { failUntil: 0, lastError: '', loading: false };
+
+function osmStatusText() {
+  if (!S.useOSM) return '';
+  if (osmState.loading) return 'carregando OSM…';
+  if (osmState.failUntil > Date.now()) return 'OSM indisponível';
+  return '';
+}
+
+// Síncrono: devolve os edifícios se a área estiver coberta; senão, null
+function osmFromCache(obs, radiusM) {
+  if (osmCovers(osmCache.center, osmCache.covered, obs, radiusM)) return osmNear(osmCache.features, obs, radiusM);
   if (!osmCache.forceRefresh) {
     const stored = loadOSMStore();
     if (stored && osmCovers(stored.center, stored.covered, obs, radiusM)) {
@@ -1128,33 +1140,41 @@ async function fetchOSMBuildings(obs, radiusM) {
       return osmNear(stored.features, obs, radiusM);
     }
   }
+  return null;
+}
 
-  // 4. Buscar com folga: cobre ajustes de raio e deslocamentos do observador
-  //    sem nova requisição. Mínimo 700m, máximo 2000m.
+function osmStartBackground(obs, radiusM) {
+  if (osmInflight) return;                                // já existe uma busca
+  if (osmState.failUntil > Date.now()) return;            // falhou há pouco: aguarda
   const covered = Math.min(2000, Math.max(700, radiusM * 1.2 * 1.6));
   const center = obs;
-  setStatus('compute', 'Buscando edifícios do mapa (OSM)...');
   const query = `[out:json][timeout:25];(way["building"](around:${Math.round(covered)},${obs[1]},${obs[0]}););out geom qt;`;
-
-  const promise = (async () => {
-    const data = await overpassQuery(query);
-    return parseOverpass(data);
-  })();
+  osmState.loading = true;
+  const promise = overpassQuery(query).then(parseOverpass);
   osmInflight = { center, covered, promise };
-
-  try {
-    const feats = await promise;
+  promise.then(feats => {
     Object.assign(osmCache, { center, radius: radiusM, covered, features: feats, forceRefresh: false });
     saveOSMStore(center, covered, feats);
+    osmState.failUntil = 0; osmState.lastError = '';
     console.log(`[Isovist] OSM: ${feats.length} edifícios carregados (área ${Math.round(covered)}m)`);
-    return osmNear(feats, obs, radiusM);
-  } catch (e) {
-    console.warn('[Isovist] Overpass indisponível:', e);
-    setStatus('compute', 'OSM indisponível — usando só edifícios do projeto');
-    return osmNear(osmCache.features || [], obs, radiusM);
-  } finally {
+    if (S.observer && S.useOSM) runCompute();             // atualiza a rosa com os edifícios OSM
+  }).catch(e => {
+    osmState.failUntil = Date.now() + OSM_RETRY_MS;
+    osmState.lastError = String(e?.message || e);
+    if (S.observer) setStatus('done', 'OSM indisponível no momento — análise só com edifícios do projeto');
+  }).finally(() => {
+    osmState.loading = false;
     if (osmInflight && osmInflight.promise === promise) osmInflight = null;
-  }
+  });
+}
+
+// Mantém o nome usado pelo compute; agora retorna imediatamente
+async function fetchOSMBuildings(obs, radiusM) {
+  const cached = osmFromCache(obs, radiusM);
+  if (cached) return cached;
+  osmStartBackground(obs, radiusM);
+  // Enquanto não chega, usa o que já houver em memória (pode ser outra área)
+  return osmNear(osmCache.features || [], obs, radiusM);
 }
 
 // ─── Cálculo: wedges coloridos por distância (estilo Ladybug) ─────────────────
@@ -1617,7 +1637,8 @@ async function runCompute() {
     const n = await compute();
     S.computeMs = Math.round(performance.now() - t0);
     const hTxt = S.observerHeight > 0 ? ` · h=${Math.round(S.observerHeight)}m` : '';
-    setStatus('done', `${n || 0} fatias${hTxt} · ${S.computeMs}ms`);
+    const osmTxt = osmStatusText();
+    setStatus('done', `${n || 0} fatias${hTxt} · ${S.computeMs}ms${osmTxt ? ' · ' + osmTxt : ''}`);
   } catch (e) { console.error(e); setStatus('error', String(e)); }
   finally { computing = false; }
   renderBtns();
@@ -1968,7 +1989,7 @@ document.getElementById('root').innerHTML = `
       <div class="legend-labels"><span>Bloqueado (perto)</span><span>Livre (longe)</span></div>
     </div>
   </div>
-  <footer class="ftr"><p>Beta V54 · © 2026 Königsberger Vannucchi</p></footer>
+  <footer class="ftr"><p>Beta V55 · © 2026 Königsberger Vannucchi</p></footer>
 </div>`;
 
 // ── Wire ─────────────────────────────────────────────────────────────────────
@@ -2072,6 +2093,7 @@ document.getElementById('btn-diag').addEventListener('click', () => {
       lines.push('  exemplo baked: layer=' + p.layerId + ' id=' + p.id + ' _base=' + p._baseHeight + ' _height=' + p._height + ' levels=' + p.levels);
     }
     lines.push('');
+    lines.push('OSM: ' + (osmState.loading ? 'carregando em segundo plano' : osmState.failUntil > Date.now() ? 'indisponível (' + osmState.lastError + ') — nova tentativa em ' + Math.ceil((osmState.failUntil - Date.now()) / 1000) + 's' : (osmCache.features?.length || 0) + ' edifícios em cache'));
     lines.push('TEMPOS DA ÚLTIMA ANÁLISE (ms): coleta ' + (lastTimings.coleta ?? 0) + ' (cache: ' + (lastTimings.cache || '—') + ') · alturas ' + lastTimings.alturas + ' · OSM ' + lastTimings.osm + ' · raycasting ' + lastTimings.raycast + '   obstáculos ' + lastTimings.obstaculos + ' (no raio: ' + lastTimings.noRaio + ')');
     lines.push('');
     lines.push('SCENARIOS — filtro: ' + (S.onlyVisibleScenarios ? 'ligado' : 'desligado'));
@@ -2091,10 +2113,11 @@ document.getElementById('btn-diag').addEventListener('click', () => {
     if (evalStatus.ok === null)  lines.push('  ainda não executada — gere uma análise primeiro');
     lines.push('  piso a piso por uso: ' + (Object.keys(usageF2F).length ? JSON.stringify(usageF2F) : '(vazio → ' + DEFAULT_F2F + 'm)'));
     lines.push('  amostra (topo avaliado × regra anterior):');
-    const amostra = obsNow.filter(o => o.properties?.id && o.properties?.source !== 'osm')
+    const comAltura = p => Number(p.levels) > 0 || Number(p.height) > 0 || Number(p._height) > 0;
+    const amostra = obsNow.filter(o => o.properties?.id && o.properties?.source !== 'osm' && comAltura(o.properties))
       .sort((a, b) => (Number(b.properties.stackOrder) || 0) - (Number(a.properties.stackOrder) || 0)).slice(0, 12);
     for (const f of amostra) {
-      const p = f.properties, ev = evalHeights.get(p.id);
+      const p = f.properties, ev = bakedTB.get(p.id) || evalHeights.get(p.id);
       const ant = getBuildingTopChain(f);
       const evTxt = ev ? ev.base.toFixed(1) + '→' + ev.top.toFixed(1) + 'm (' + ev.src + ')' : 'sem dado';
       lines.push('   • ' + (p.layerId || '?') + ' | pav ' + (p.levels ?? '—') + ' | ' + evTxt + ' | antes: ' + ant.toFixed(1) + 'm');
@@ -2194,7 +2217,7 @@ wireControl('d', v => S.coneDir = v);
 // Botão refazer análise: força re-leitura de obstáculos e OSM
 document.getElementById('btn-redo').addEventListener('click', async () => {
   if (!S.observer || S.status === 'compute') return;
-  osmCache.center = null; osmCache.forceRefresh = true; clearOSMStore(); evalSig = null; obstCache.key = null; // força re-fetch do OSM e releitura das alturas
+  osmCache.center = null; osmCache.forceRefresh = true; clearOSMStore(); evalSig = null; obstCache.key = null; osmState.failUntil = 0; // força re-fetch do OSM e releitura das alturas
   // Se o observador veio de um elemento, re-lê a posição/altura atual dele
   if (S.observerFeatId) {
     let raw = giraffeState.get('rawSections') || [];
