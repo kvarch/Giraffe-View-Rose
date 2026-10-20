@@ -406,6 +406,10 @@ const LO = 'isov';
 const RAY_STEP = 2;
 const SP_TAG = 'isovist_rose';
 let lastObstacleStats = { raw: 0, baked: 0 };
+let lastAnalysis = null;   // última análise temporária { id, obs, h, wedges, label }
+let analysisSeq = 0;       // contador de análises (para saber se a atual já foi salva)
+let savedInfo = null;      // { id, layer } da última análise salva
+let saving = false;
 let lastTimings = { alturas: 0, osm: 0, raycast: 0, obstaculos: 0, noRaio: 0 };  // origem dos obstáculos (diagnóstico)   // marcador das rosas permanentes (usado em getObstacles e renderPermanent)
 
 const S = {
@@ -1346,15 +1350,11 @@ async function compute() {
   lastTimings.obstaculos = polys.length;
   lastTimings.noRaio = prepared.length;
   console.log('[Isovist] tempos (ms):', JSON.stringify(lastTimings));
-  if (S.permanent) {
-    // ── Modo permanente: cria seções reais no projeto (rawSections) ──────────
-    // Para não pesar o modelo, agrupa fatias consecutivas de cor semelhante
-    // (12 buckets) em polígonos-leque únicos — reduz ~180 fatias para ~15-30.
-    await renderPermanent(obs, wedgeFeatures, h);
-    // Limpa a layer temporária se existir (modo trocado)
-    try { await rpc.invoke('removeTempLayer', [`${LO}_rose`]); } catch {}
-  } else {
-    // ── Modo temporário (padrão): rápido, some ao fechar o projeto ───────────
+  // A análise roda SEMPRE em camada temporária. Salvar como layer permanente é
+  // uma ação separada (botão 💾), que grava uma cópia estática desta análise.
+  lastAnalysis = { id: ++analysisSeq, obs: obs.slice(), h, wedges: wedgeFeatures, label: S.observerLabel };
+  {
+    // ── Camada temporária: rápida, some ao fechar o projeto ─────────────────
     const fc = { type: 'FeatureCollection', features: wedgeFeatures };
     await renderLayer(`${LO}_rose`, fc, {
       type: 'fill-extrusion',
@@ -1504,8 +1504,8 @@ function cleanFanRing(obs, tips) {
   return ring;
 }
 
-async function renderPermanent(obs, wedges, h) {
-  const tag = obsTag(obs); // tag único por ponto de observação
+async function renderPermanent(obs, wedges, h, tag) {
+  // tag única por salvamento: cada salvamento é um layer novo e independente
   const permLayer = (await ensurePermLayer(tag)) || 'default';
 
   // 1. Agrupar wedges consecutivos por bucket de cor (12 níveis)
@@ -1553,10 +1553,11 @@ async function renderPermanent(obs, wedges, h) {
   }
 
   // 3. Apagar só a análise desse ponto e recriar (outros pontos intocados)
-  await deleteObsSections(tag);
+  // Nada é apagado: salvamentos anteriores ficam intactos.
   try {
     await rpc.invoke('createRawSections', [sectionFeatures]);
     console.log(`[Isovist] ${sectionFeatures.length} seções criadas para tag ${tag} no layer "${permLayer}"`);
+    return { ok: true, layer: permLayer, n: sectionFeatures.length };
   } catch(e) {
     let err = e;
     if (skippedFans) console.warn(`[Isovist] ${skippedFans} leque(s) degenerado(s) descartado(s)`);
@@ -1568,12 +1569,33 @@ async function renderPermanent(obs, wedges, h) {
         for (const sf of sectionFeatures) sf.properties.layerId = 'default';
         await rpc.invoke('createRawSections', [sectionFeatures]);
         console.warn(`[Isovist] layer "${permLayer}" recusado — seções criadas no "default"`);
-        return;
+        return { ok: true, layer: 'default', n: sectionFeatures.length };
       } catch (e2) { err = e2; }
     }
     console.error('[Isovist] createRawSections:', err);
-    setStatus('error', 'Falha ao criar seções permanentes: ' + err);
+    return { ok: false, err: String(err?.message || err) };
   }
+}
+
+// ─── Botão 💾: grava uma cópia estática da análise temporária atual ─────────
+async function saveCurrentAnalysis() {
+  if (!lastAnalysis || saving || S.status === 'compute' || S.status === 'waiting') return;
+  if (savedInfo && savedInfo.id === lastAnalysis.id) return;      // esta já foi salva
+  saving = true; renderBtns();
+  setStatus('compute', 'Salvando layer permanente...');
+  const snap = lastAnalysis;
+  const tag = `${SP_TAG}_saved_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+  let r;
+  try { r = await renderPermanent(snap.obs, snap.wedges, snap.h, tag); }
+  catch (e) { r = { ok: false, err: String(e?.message || e) }; }
+  saving = false;
+  if (r?.ok) {
+    savedInfo = { id: snap.id, layer: r.layer };
+    setStatus('done', `Salvo no layer "${r.layer}" · ${r.n} seções`);
+  } else {
+    setStatus('error', 'Falha ao salvar: ' + (r?.err || 'erro desconhecido'));
+  }
+  renderBtns();
 }
 
 async function clearLayers() {
@@ -1615,6 +1637,17 @@ function renderBtns() {
   bc.style.display = (S.status === 'done' || S.status === 'error') ? '' : 'none';
   const br = document.getElementById('btn-redo');
   if (br) br.style.display = (S.observer && S.status !== 'waiting' && S.status !== 'compute') ? '' : 'none';
+  const bsv = document.getElementById('btn-save');
+  if (bsv) {
+    const tem = !!(lastAnalysis && S.observer);
+    const jaSalva = tem && savedInfo && savedInfo.id === lastAnalysis.id;
+    bsv.style.display = tem ? '' : 'none';
+    bsv.disabled = saving || jaSalva || S.status === 'compute' || S.status === 'waiting';
+    bsv.innerHTML = saving ? '<span class="spinner"></span> Salvando...'
+      : jaSalva ? '✓ Salvo em layer permanente'
+      : '💾 Salvar como layer permanente';
+    bsv.title = jaSalva ? `Salvo no layer "${savedInfo.layer}". Faça uma nova análise para salvar outra versão.` : '';
+  }
 }
 function renderInfo() {
   const el = document.getElementById('info-obs'); if (!el) return;
@@ -1923,7 +1956,7 @@ async function fromMap() {
   } catch { console.warn('drawPoint indisponível'); }
 }
 
-async function clearAll() { clearTimeout(debounce); S.observer = null; S.computeMs = null; S.observerFeatId = null; S.observerHeight = 0; setStatus('idle', ''); renderObs(); renderBtns(); await clearLayers(); }
+async function clearAll() { clearTimeout(debounce); lastAnalysis = null; S.observer = null; S.computeMs = null; S.observerFeatId = null; S.observerHeight = 0; setStatus('idle', ''); renderObs(); renderBtns(); await clearLayers(); }
 
 // ─── DOM ──────────────────────────────────────────────────────────────────────
 document.getElementById('root').innerHTML = `
@@ -1951,6 +1984,7 @@ document.getElementById('root').innerHTML = `
     <button class="btn btn-sel" id="btn-sel">⊙ Observar do edifício selecionado</button>
     <button class="btn btn-primary" id="btn-point">◎ Observar de um ponto no mapa</button>
     <button class="btn btn-primary" id="btn-redo" aria-label="Refazer análise" style="display:none">↻ Refazer análise</button>
+    <button class="btn btn-sel" id="btn-save" aria-label="Salvar a análise atual como layer permanente" style="display:none">💾 Salvar como layer permanente</button>
     <button class="btn btn-clear" id="btn-clear" aria-label="Limpar análise" style="display:none">✕ Limpar análise</button>
     <div class="divider"><span>Obstruções</span></div>
     <div class="toggle-row"><button class="toggle" id="toggle-obs" aria-label="Ativar raycasting contra edifícios" role="switch" aria-checked="true"></button><span class="toggle-label">Raycasting contra edifícios</span></div>
@@ -1974,7 +2008,7 @@ document.getElementById('root').innerHTML = `
     <pre id="diag-out" style="display:none;background:var(--md-sys-color-surface-container-low);border:1px solid var(--md-sys-color-outline-variant);padding:8px;font-size:9px;max-height:200px;overflow:auto;white-space:pre-wrap;word-break:break-all;color:var(--md-sys-color-on-surface-variant);margin:0"></pre>
     <div class="info-box" id="info-obs">—</div>
     <div class="divider"><span>Saída</span></div>
-    <div class="toggle-row"><button class="toggle" id="toggle-perm" aria-label="Ativar layer permanente" role="switch" aria-checked="false"></button><span class="toggle-label">Layer permanente (salvo no projeto)</span></div>
+
     <div class="divider"><span>Parâmetros</span></div>
     <div class="sl-grp"><div class="sl-row"><span class="sl-lbl">Altura do observador</span><span class="val-wrap"><input type="number" class="val-input" id="num-h" min="0" max="300" step="1" value="0"/><span class="val-unit">m</span></span></div><input type="range" id="sl-h" min="0" max="300" step="1" value="0"/><div class="sl-ticks"><span>0m</span><span>150m</span><span>300m</span></div></div>
     <div class="sl-grp"><div class="sl-row"><span class="sl-lbl">Raio máximo</span><span class="val-wrap"><input type="number" class="val-input" id="num-r" min="50" max="1000" step="25" value="300"/><span class="val-unit">m</span></span></div><input type="range" id="sl-r" min="50" max="1000" step="25" value="300"/><div class="sl-ticks"><span>50m</span><span>500m</span><span>1km</span></div></div>
@@ -1989,7 +2023,7 @@ document.getElementById('root').innerHTML = `
       <div class="legend-labels"><span>Bloqueado (perto)</span><span>Livre (longe)</span></div>
     </div>
   </div>
-  <footer class="ftr"><p>Beta V55 · © 2026 Königsberger Vannucchi</p></footer>
+  <footer class="ftr"><p>Beta V56 · © 2026 Königsberger Vannucchi</p></footer>
 </div>`;
 
 // ── Wire ─────────────────────────────────────────────────────────────────────
@@ -2190,7 +2224,7 @@ giraffeState.addListener(['layerTree'], () => {
     if (S.observer) scheduleSync('visibilidade de layer alterada');
   }, 250);
 });
-document.getElementById('toggle-perm').addEventListener('click', function () { S.permanent = !S.permanent; this.className = 'toggle' + (S.permanent ? ' on' : ''); scheduleRecompute(); });
+document.getElementById('btn-save').addEventListener('click', saveCurrentAnalysis);
 // Sliders + inputs numéricos (bidirecional)
 function wireControl(key, setter, extra) {
   const sl = document.getElementById('sl-' + key);
@@ -2292,7 +2326,8 @@ function snapshotState() {
     observer: S.observer, observerLabel: S.observerLabel, observerFeatId: S.observerFeatId,
     observerHeight: S.observerHeight, observerIsPoint: S.observerIsPoint, manualHeight: S.manualHeight,
     radius: S.radius, cone: S.cone, coneDir: S.coneDir,
-    useObs: S.useObs, useOSM: S.useOSM, permanent: S.permanent,
+    useObs: S.useObs, useOSM: S.useOSM,
+    lastAnalysis, analysisSeq, savedInfo,
     onlyVisible: S.onlyVisible, autoSync: S.autoSync, useEvalHeights: S.useEvalHeights, onlyVisibleScenarios: S.onlyVisibleScenarios,
     excludedLayers: [...S.excludedLayers],
     palette: activePalette,
@@ -2331,12 +2366,16 @@ function restoreState() {
     if (gd) gd.style.display = d.cone >= 359.9 ? 'none' : '';
   }
   if (Number.isFinite(d.coneDir)) { S.coneDir = d.coneDir; syncControl('d', d.coneDir); }
-  for (const [k, id] of [['useObs','toggle-obs'],['useOSM','toggle-osm'],['permanent','toggle-perm'],
+  for (const [k, id] of [['useObs','toggle-obs'],['useOSM','toggle-osm'],
                          ['onlyVisible','toggle-vis'],['autoSync','toggle-sync'],['useEvalHeights','toggle-evalh'],['onlyVisibleScenarios','toggle-scn']]) {
     if (typeof d[k] === 'boolean') { S[k] = d[k]; setToggleUI(id, d[k]); }
   }
   if (Array.isArray(d.excludedLayers)) S.excludedLayers = new Set(d.excludedLayers);
   if (d.permLayers && typeof d.permLayers === 'object') S.permLayers = d.permLayers;
+  S.permanent = false;   // modo permanente automático foi substituído pelo botão 💾
+  if (Number.isFinite(d.analysisSeq)) analysisSeq = d.analysisSeq;
+  if (d.lastAnalysis && Array.isArray(d.lastAnalysis.wedges)) lastAnalysis = d.lastAnalysis;
+  if (d.savedInfo && d.savedInfo.id) savedInfo = d.savedInfo;
   if (Number.isFinite(d.permSeq)) S.permSeq = d.permSeq;
   if (d.palette && PALETTES[d.palette]) {
     activePalette = d.palette;
