@@ -1492,7 +1492,7 @@ function cleanFanRing(obs, tips) {
     if (!Array.isArray(t) || !Number.isFinite(t[0]) || !Number.isFinite(t[1])) continue;
     if (same(t, obs)) continue;
     if (out.some(o => same(o, t))) continue;
-    out.push(t);
+    out.push([+t[0], +t[1]]);   // pontas sempre 2D
   }
   if (out.length < 2) return null;
   const ring = [obs, ...out, obs];
@@ -1505,6 +1505,14 @@ function cleanFanRing(obs, tips) {
 }
 
 async function renderPermanent(obs, wedges, h, tag) {
+  // Coordenadas sempre 2D e numéricas (vale também para análises restauradas
+  // de sessões anteriores, que podem ter guardado o observador com elevação)
+  const to2D = c => (Array.isArray(c) && Number.isFinite(+c[0]) && Number.isFinite(+c[1])) ? [+c[0], +c[1]] : null;
+  obs = to2D(obs);
+  if (!obs) return { ok: false, err: 'observador sem coordenadas válidas' };
+  h = Number.isFinite(+h) ? +h : 0;
+  if (!Array.isArray(wedges) || !wedges.length) return { ok: false, err: 'nenhuma análise para salvar' };
+
   // tag única por salvamento: cada salvamento é um layer novo e independente
   const permLayer = (await ensurePermLayer(tag)) || 'default';
 
@@ -1553,6 +1561,7 @@ async function renderPermanent(obs, wedges, h, tag) {
   }
 
   // 3. Apagar só a análise desse ponto e recriar (outros pontos intocados)
+  if (!sectionFeatures.length) return { ok: false, err: 'nenhuma seção válida para salvar' };
   // Nada é apagado: salvamentos anteriores ficam intactos.
   try {
     await rpc.invoke('createRawSections', [sectionFeatures]);
@@ -1563,7 +1572,7 @@ async function renderPermanent(obs, wedges, h, tag) {
     if (skippedFans) console.warn(`[Isovist] ${skippedFans} leque(s) degenerado(s) descartado(s)`);
     // Se o layer próprio foi recusado, tenta no 'default' (comportamento anterior).
     // Erro de geometria não tem relação com o layer: repetir só duplicaria o aviso.
-    const erroGeometria = /vert|polygon|geometr|self|kink|coordinate/i.test(String(e?.message || e));
+    const erroGeometria = /vert|polygon|geometr|self|kink|coordinate|cleanedSections|destructure/i.test(String(e?.message || e));
     if (permLayer !== 'default' && !erroGeometria) {
       try {
         for (const sf of sectionFeatures) sf.properties.layerId = 'default';
@@ -1944,7 +1953,11 @@ async function fromMap() {
     if (!isListening) return;
     if (pt) {
       isListening = false;
-      S.observer = Array.isArray(pt) ? pt : [pt.lng ?? pt[0], pt.lat ?? pt[1]];
+      // Só longitude e latitude: sobre terreno 3D o drawPoint pode devolver também
+      // a elevação [lng, lat, z], e coordenadas mistas (3D no observador, 2D nas
+      // pontas) fazem o Giraffe recusar as seções ao salvar.
+      const ptArr = Array.isArray(pt) ? pt : [pt.lng ?? pt[0], pt.lat ?? pt[1]];
+      S.observer = [Number(ptArr[0]), Number(ptArr[1])];
       S.observerLabel = 'Ponto no mapa';
       S.observerIsPoint = true;
       S.manualHeight = false;
@@ -2023,7 +2036,7 @@ document.getElementById('root').innerHTML = `
       <div class="legend-labels"><span>Bloqueado (perto)</span><span>Livre (longe)</span></div>
     </div>
   </div>
-  <footer class="ftr"><p>Beta V56 · © 2026 Königsberger Vannucchi</p></footer>
+  <footer class="ftr"><p>Beta V57 · © 2026 Königsberger Vannucchi</p></footer>
 </div>`;
 
 // ── Wire ─────────────────────────────────────────────────────────────────────
@@ -2385,7 +2398,7 @@ function restoreState() {
 
   // Vínculo com o observador
   if (Array.isArray(d.observer) && d.observer.length >= 2) {
-    S.observer = d.observer;
+    S.observer = [Number(d.observer[0]), Number(d.observer[1])];
     S.observerLabel = d.observerLabel || '';
     S.observerFeatId = d.observerFeatId || null;
     S.observerHeight = Number(d.observerHeight) || 0;
